@@ -777,21 +777,12 @@ def update():
     Pull latest code from GitHub and rebuild containers.
     Runs /app/update.sh in the background — bot will restart automatically.
     """
-    import subprocess
-    update_script = Path("/app/update.sh")
-    if not update_script.exists():
-        return jsonify({"ok": False, "error": "Update script not found on server"}), 500
+    # Write a trigger file on the shared data volume.
+    # A host-side cron job watches for this file and runs update.sh
+    # This way the update runs on the HOST and survives container restarts.
+    trigger = Path("/app/data/update.trigger")
     try:
-        # Use nohup + setsid so the script runs as a new session on the host
-        # and survives when this container shuts down during the rebuild
-        subprocess.Popen(
-            ["nohup", "/bin/bash", str(update_script)],
-            stdout=open("/app/data/update.log", "w"),
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True
-        )
+        trigger.write_text("update")
         return jsonify({
             "ok":      True,
             "message": "Update started. Bot will restart in ~2 minutes. Refresh the dashboard."
