@@ -5,7 +5,8 @@ services:
     container_name: kraken-btc-bot
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -23,7 +24,8 @@ services:
     ports:
       - "8081:8081"
     env_file:
-      - .env
+      - path: .env
+        required: false
     volumes:
       - ./data:/app/data
       - ./.env:/app/.env
