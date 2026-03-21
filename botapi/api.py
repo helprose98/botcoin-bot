@@ -26,10 +26,10 @@ import hashlib as hl
 import hmac as hmac_mod
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from flask import Flask, jsonify, request, abort
+from flask import Flask, jsonify, request, abort, send_from_directory
 from flask_cors import CORS
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static")
 
 # Allow requests from any origin — dashboard server IP restriction
 # is enforced at the firewall level (Vultr firewall rules)
@@ -385,6 +385,18 @@ def _btc_stack_history():
         seen[r["date"]] = r
     return [{"date": d, "btc": round(v["btc_balance"], 8), "basis": round(v["avg_cost_basis"], 2)}
             for d, v in sorted(seen.items())]
+
+
+# ── Setup wizard page ──────────────────────────────────────────────────
+
+@app.route("/")
+@app.route("/setup")
+def setup_page():
+    """Serve the setup wizard. After setup, users connect via BotCoin-Dash."""
+    configured = ENV_PATH.exists() and bool(_read_env().get("KRAKEN_API_KEY", "").strip())
+    if configured:
+        return jsonify({"status": "configured", "message": "Bot is configured. Connect via BotCoin-Dash."}), 200
+    return send_from_directory(app.static_folder, "setup.html")
 
 
 # ── Health (public — no auth) ─────────────────────────────────────────────────

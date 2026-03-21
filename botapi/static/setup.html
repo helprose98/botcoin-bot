@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BotCoin — Setup Wizard</title>
+<!--
+   ______                            __
+  / ____/___  ____ ___  ____  __  __/ /____  _____
+ / /   / __ \/ __ `__ \/ __ \/ / / / __/ _ \/ ___/
+/ /___/ /_/ / / / / / / /_/ / /_/ / /_/  __/ /
+\____/\____/_/ /_/ /_/ .___/\__,_/\__/\___/_/
+                    /_/
+        Created with Perplexity Computer
+        https://www.perplexity.ai/computer
+-->
+<meta name="generator" content="Perplexity Computer">
+<meta name="author" content="Perplexity Computer">
+<meta property="og:see_also" content="https://www.perplexity.ai/computer">
+<link rel="author" href="https://www.perplexity.ai/computer">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0f0e0d;
+    --surface: #161514;
+    --surface-2: #1c1b19;
+    --surface-3: #222120;
+    --border: #2e2d2b;
+    --divider: #252422;
+    --text: #e8e6e3;
+    --text-muted: #7a7875;
+    --text-faint: #4a4845;
+    --accent: #f7931a;
+    --accent-hover: #e8841a;
+    --accent-dim: rgba(247, 147, 26, 0.12);
+    --green: #4ade80;
+    --red: #f87171;
+    --gold: #fbbf24;
+    --radius-md: 0.5rem;
+    --radius-lg: 0.75rem;
+    --radius-xl: 1rem;
+  }
+
+  html { font-size: 16px; }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  .wizard-wrapper {
+    width: 100%;
+    max-width: 520px;
+  }
+
+  /* Logo */
+  .logo {
+    text-align: center;
+    margin-bottom: 1.5rem;
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .logo span { color: var(--accent); }
+
+  /* Progress */
+  .progress {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    margin-bottom: 2rem;
+  }
+  .progress-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--surface-3);
+    border: 2px solid var(--border);
+    transition: all 0.3s ease;
+  }
+  .progress-dot.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    box-shadow: 0 0 8px rgba(247, 147, 26, 0.4);
+  }
+  .progress-dot.completed {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .progress-line {
+    width: 40px;
+    height: 2px;
+    background: var(--border);
+    transition: background 0.3s ease;
+  }
+  .progress-line.active {
+    background: var(--accent);
+  }
+
+  /* Card */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    padding: 2rem;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  }
+
+  /* Steps */
+  .step {
+    display: none;
+    animation: fadeIn 0.35s ease;
+  }
+  .step.active { display: block; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  h2 {
+    font-size: 1.375rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 0.5rem;
+    color: var(--text);
+  }
+
+  .subtext {
+    color: var(--text-muted);
+    font-size: 0.875rem;
+    margin-bottom: 1.5rem;
+    line-height: 1.6;
+  }
+
+  /* Feature bullets */
+  .features {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-bottom: 2rem;
+  }
+  .features li {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.875rem 1rem;
+    background: var(--surface-2);
+    border-radius: var(--radius-lg);
+    font-size: 0.9375rem;
+    font-weight: 500;
+    border: 1px solid var(--divider);
+  }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.8125rem 1.5rem;
+    background: var(--accent);
+    color: #000;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    border: none;
+    border-radius: var(--radius-lg);
+    cursor: pointer;
+    transition: background 0.2s ease, transform 0.1s ease;
+  }
+  .btn:hover { background: var(--accent-hover); }
+  .btn:active { transform: scale(0.98); }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  /* Inputs */
+  .field { margin-bottom: 1rem; }
+  .field:last-of-type { margin-bottom: 0; }
+
+  label {
+    display: block;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 0.375rem;
+  }
+
+  .hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+    line-height: 1.5;
+  }
+
+  input[type="text"],
+  input[type="password"],
+  input[type="number"],
+  input[type="time"],
+  select {
+    width: 100%;
+    padding: 0.6875rem 0.875rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.875rem;
+    outline: none;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  input:focus, select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+  input::placeholder { color: var(--text-faint); }
+  select { cursor: pointer; }
+  select option { background: var(--surface-2); color: var(--text); }
+
+  /* Password wrapper */
+  .pw-wrapper {
+    position: relative;
+  }
+  .pw-wrapper input { padding-right: 3rem; }
+  .pw-toggle {
+    position: absolute;
+    right: 0.75rem;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.75rem;
+    font-family: 'Inter', sans-serif;
+    font-weight: 500;
+    padding: 0.25rem;
+    transition: color 0.2s ease;
+  }
+  .pw-toggle:hover { color: var(--text); }
+
+  /* Grid */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  @media (max-width: 480px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+
+  /* Mode cards */
+  .mode-section {
+    margin-top: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .mode-section > label { margin-bottom: 0.75rem; }
+
+  .mode-cards {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.625rem;
+  }
+  .mode-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.875rem 0.5rem;
+    background: var(--surface-2);
+    border: 2px solid var(--border);
+    border-radius: var(--radius-lg);
+    cursor: pointer;
+    transition: border-color 0.2s ease, background 0.2s ease;
+    text-align: center;
+  }
+  .mode-card:hover { border-color: var(--text-faint); }
+  .mode-card.selected {
+    border-color: var(--accent);
+    background: var(--accent-dim);
+  }
+  .mode-card .mode-icon { font-size: 1.25rem; }
+  .mode-card .mode-label {
+    font-size: 0.8125rem;
+    font-weight: 600;
+  }
+
+  /* Toggle */
+  .toggle-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.875rem;
+    padding: 1rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    margin-bottom: 1.5rem;
+  }
+  .toggle-track {
+    position: relative;
+    width: 44px;
+    min-width: 44px;
+    height: 24px;
+    background: var(--surface-3);
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background 0.2s ease;
+    border: 1px solid var(--border);
+    margin-top: 2px;
+  }
+  .toggle-track.on {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .toggle-thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #fff;
+    transition: transform 0.2s ease;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+  .toggle-track.on .toggle-thumb {
+    transform: translateX(20px);
+  }
+  .toggle-info { flex: 1; }
+  .toggle-label {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 0.125rem;
+  }
+  .toggle-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+
+  /* Messages */
+  .msg {
+    display: none;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius-md);
+    font-size: 0.8125rem;
+    font-weight: 500;
+    margin-top: 1rem;
+    line-height: 1.5;
+  }
+  .msg.success {
+    display: block;
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid rgba(74, 222, 128, 0.25);
+    color: var(--green);
+  }
+  .msg.error {
+    display: block;
+    background: rgba(248, 113, 113, 0.1);
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    color: var(--red);
+  }
+
+  /* Spinner */
+  .spinner {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    border: 2px solid rgba(0,0,0,0.2);
+    border-top-color: #000;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Success screen */
+  .success-screen { text-align: center; }
+  .success-icon { font-size: 3.5rem; margin-bottom: 1rem; }
+  .success-screen h2 {
+    font-size: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .info-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 0.625rem;
+    margin-bottom: 1.5rem;
+    text-align: left;
+  }
+  .info-card {
+    padding: 0.875rem 1rem;
+    background: var(--surface-2);
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-lg);
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+  .info-card code {
+    font-family: 'JetBrains Mono', monospace;
+    background: var(--surface-3);
+    padding: 0.125rem 0.375rem;
+    border-radius: 4px;
+    font-size: 0.8125rem;
+    color: var(--accent);
+  }
+  .paper-note {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.625rem 1rem;
+    background: rgba(251, 191, 36, 0.1);
+    border: 1px solid rgba(251, 191, 36, 0.25);
+    border-radius: var(--radius-md);
+    font-size: 0.8125rem;
+    color: var(--gold);
+    font-weight: 500;
+    margin-bottom: 1.5rem;
+  }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    margin-top: 1.5rem;
+    font-size: 0.75rem;
+    color: var(--text-faint);
+  }
+  .footer a {
+    color: var(--text-muted);
+    text-decoration: none;
+    transition: color 0.2s ease;
+  }
+  .footer a:hover { color: var(--accent); }
+
+  /* Divider spacing */
+  .section-divider {
+    border: none;
+    border-top: 1px solid var(--divider);
+    margin: 1.5rem 0;
+  }
+</style>
+</head>
+<body>
+  <div class="wizard-wrapper">
+    <!-- Logo -->
+    <div class="logo">🟠 <span>BotCoin</span></div>
+
+    <!-- Progress -->
+    <div class="progress" id="progress">
+      <div class="progress-dot active" data-step="1"></div>
+      <div class="progress-line" data-line="1"></div>
+      <div class="progress-dot" data-step="2"></div>
+      <div class="progress-line" data-line="2"></div>
+      <div class="progress-dot" data-step="3"></div>
+      <div class="progress-line" data-line="3"></div>
+      <div class="progress-dot" data-step="4"></div>
+    </div>
+
+    <!-- Card -->
+    <div class="card">
+      <!-- Step 1: Welcome -->
+      <div class="step active" id="step-1">
+        <h2>Welcome to BotCoin</h2>
+        <p class="subtext">Let's get your Bitcoin accumulation bot running. This takes about 2 minutes.</p>
+        <ul class="features">
+          <li>🟠 Automated BTC DCA buying</li>
+          <li>📈 Dip detection &amp; recycler strategy</li>
+          <li>📱 Remote dashboard via BotCoin-Dash</li>
+        </ul>
+        <button class="btn" onclick="goTo(2)">Get Started →</button>
+      </div>
+
+      <!-- Step 2: Kraken API Keys -->
+      <div class="step" id="step-2">
+        <h2>Connect Your Kraken Account</h2>
+        <p class="subtext">Create API keys at Kraken with <strong>Query Funds</strong>, <strong>Query Orders</strong>, and <strong>Create &amp; Modify Orders</strong> permissions.</p>
+        <div class="field">
+          <label for="api-key">API Key</label>
+          <input type="text" id="api-key" placeholder="Enter your Kraken API key" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="api-secret">API Secret</label>
+          <div class="pw-wrapper">
+            <input type="password" id="api-secret" placeholder="Enter your Kraken API secret" autocomplete="off" spellcheck="false">
+            <button class="pw-toggle" type="button" onclick="togglePw(this)">Show</button>
+          </div>
+        </div>
+        <button class="btn" id="btn-validate" onclick="validateKeys()" style="margin-top: 1.5rem;">Validate Keys →</button>
+        <div id="msg-keys"></div>
+      </div>
+
+      <!-- Step 3: DCA Settings -->
+      <div class="step" id="step-3">
+        <h2>Configure Your DCA</h2>
+        <div class="grid-2">
+          <div class="field">
+            <label for="dca-amount">Investment Amount ($)</label>
+            <input type="number" id="dca-amount" value="50" min="5" step="1">
+            <p class="hint">Per DCA buy</p>
+          </div>
+          <div class="field">
+            <label for="dca-freq">Frequency</label>
+            <select id="dca-freq" onchange="onFreqChange()">
+              <option value="daily">Daily</option>
+              <option value="weekly" selected>Weekly</option>
+              <option value="monthly">Monthly</option>
+            </select>
+          </div>
+          <div class="field" id="day-field">
+            <label for="dca-day">Day of Week</label>
+            <select id="dca-day">
+              <option value="monday">Monday</option>
+              <option value="tuesday">Tuesday</option>
+              <option value="wednesday">Wednesday</option>
+              <option value="thursday" selected>Thursday</option>
+              <option value="friday">Friday</option>
+              <option value="saturday">Saturday</option>
+              <option value="sunday">Sunday</option>
+            </select>
+          </div>
+          <div class="field" id="dom-field" style="display:none;">
+            <label for="dca-dom">Day of Month</label>
+            <select id="dca-dom"></select>
+          </div>
+          <div class="field">
+            <label for="dca-time">Time (your local time)</label>
+            <input type="time" id="dca-time" value="09:00">
+          </div>
+        </div>
+
+        <div class="mode-section">
+          <label>Bot Mode</label>
+          <div class="mode-cards">
+            <div class="mode-card selected" data-mode="stack_btc" onclick="selectMode(this)">
+              <span class="mode-icon">🟠</span>
+              <span class="mode-label">Stack BTC</span>
+            </div>
+            <div class="mode-card" data-mode="stack_usd" onclick="selectMode(this)">
+              <span class="mode-icon">🔵</span>
+              <span class="mode-label">Stack USD</span>
+            </div>
+            <div class="mode-card" data-mode="auto" onclick="selectMode(this)">
+              <span class="mode-icon">⚡</span>
+              <span class="mode-label">Auto</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="toggle-row">
+          <div class="toggle-track on" id="paper-toggle" onclick="togglePaper()">
+            <div class="toggle-thumb"></div>
+          </div>
+          <div class="toggle-info">
+            <div class="toggle-label">Paper Trading Mode</div>
+            <div class="toggle-hint">Simulate trades without real money — recommended for first run</div>
+          </div>
+        </div>
+
+        <button class="btn" onclick="goTo(4)">Continue →</button>
+      </div>
+
+      <!-- Step 4: Dashboard Password -->
+      <div class="step" id="step-4">
+        <h2>Set Dashboard Password</h2>
+        <p class="subtext">This password protects access to your bot from the BotCoin-Dash interface.</p>
+        <div class="field">
+          <label for="dash-pw">Password</label>
+          <div class="pw-wrapper">
+            <input type="password" id="dash-pw" placeholder="Choose a strong password" autocomplete="new-password">
+            <button class="pw-toggle" type="button" onclick="togglePw(this)">Show</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="dash-pw-confirm">Confirm Password</label>
+          <div class="pw-wrapper">
+            <input type="password" id="dash-pw-confirm" placeholder="Re-enter your password" autocomplete="new-password">
+            <button class="pw-toggle" type="button" onclick="togglePw(this)">Show</button>
+          </div>
+        </div>
+        <button class="btn" id="btn-complete" onclick="completeSetup()" style="margin-top: 1.5rem;">Complete Setup →</button>
+        <div id="msg-complete"></div>
+      </div>
+
+      <!-- Success Screen -->
+      <div class="step" id="step-success">
+        <div class="success-screen">
+          <div class="success-icon">🟠</div>
+          <h2>Bot is Running!</h2>
+          <div class="info-cards">
+            <div class="info-card">Your bot is stacking BTC automatically</div>
+            <div class="info-card">Connect your dashboard at the <strong>BotCoin-Dash</strong> app</div>
+            <div class="info-card">Enter this server's IP when connecting: <code id="server-ip"></code></div>
+          </div>
+          <div id="paper-note" class="paper-note" style="display: none;">
+            ⚠️ Paper Trading is ON — switch to live in Settings when ready
+          </div>
+          <div class="footer">
+            Created with <a href="https://www.perplexity.ai/computer" target="_blank" rel="noopener">Perplexity Computer</a>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer (shown during wizard steps) -->
+    <div class="footer" id="wizard-footer">
+      Created with <a href="https://www.perplexity.ai/computer" target="_blank" rel="noopener">Perplexity Computer</a>
+    </div>
+  </div>
+
+<script>
+  // ── State ──────────────────────────────────────────────
+  let currentStep = 1;
+  let selectedMode = 'stack_btc';
+  let paperTrading = true;
+  let validatedKeys = false;
+
+  // Populate day-of-month dropdown
+  const domSelect = document.getElementById('dca-dom');
+  for (let i = 1; i <= 28; i++) {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = i;
+    if (i === 1) opt.selected = true;
+    domSelect.appendChild(opt);
+  }
+
+  // ── Navigation ─────────────────────────────────────────
+  function goTo(step) {
+    // Validation before leaving step 3
+    if (currentStep === 3 && step === 4) {
+      const amount = parseFloat(document.getElementById('dca-amount').value);
+      if (isNaN(amount) || amount < 5) {
+        alert('Investment amount must be at least $5.');
+        return;
+      }
+    }
+
+    document.getElementById('step-' + currentStep).classList.remove('active');
+    currentStep = step;
+
+    const target = step === 'success' ? 'step-success' : 'step-' + step;
+    document.getElementById(target).classList.add('active');
+    updateProgress(step);
+
+    if (step === 'success') {
+      document.getElementById('wizard-footer').style.display = 'none';
+    }
+  }
+
+  function updateProgress(step) {
+    const dots = document.querySelectorAll('.progress-dot');
+    const lines = document.querySelectorAll('.progress-line');
+
+    if (step === 'success') {
+      dots.forEach(d => { d.classList.add('completed'); d.classList.remove('active'); });
+      lines.forEach(l => l.classList.add('active'));
+      return;
+    }
+
+    dots.forEach((dot, i) => {
+      const s = i + 1;
+      dot.classList.remove('active', 'completed');
+      if (s < step) dot.classList.add('completed');
+      else if (s === step) dot.classList.add('active');
+    });
+
+    lines.forEach((line, i) => {
+      const s = i + 1;
+      line.classList.toggle('active', s < step);
+    });
+  }
+
+  // ── Password Toggle ────────────────────────────────────
+  function togglePw(btn) {
+    const input = btn.previousElementSibling;
+    if (input.type === 'password') {
+      input.type = 'text';
+      btn.textContent = 'Hide';
+    } else {
+      input.type = 'password';
+      btn.textContent = 'Show';
+    }
+  }
+
+  // ── Frequency Change ───────────────────────────────────
+  function onFreqChange() {
+    const freq = document.getElementById('dca-freq').value;
+    document.getElementById('day-field').style.display = freq === 'weekly' ? '' : 'none';
+    document.getElementById('dom-field').style.display = freq === 'monthly' ? '' : 'none';
+  }
+
+  // ── Mode Selection ─────────────────────────────────────
+  function selectMode(el) {
+    document.querySelectorAll('.mode-card').forEach(c => c.classList.remove('selected'));
+    el.classList.add('selected');
+    selectedMode = el.dataset.mode;
+  }
+
+  // ── Paper Trading Toggle ───────────────────────────────
+  function togglePaper() {
+    paperTrading = !paperTrading;
+    document.getElementById('paper-toggle').classList.toggle('on', paperTrading);
+  }
+
+  // ── Validate Keys ──────────────────────────────────────
+  async function validateKeys() {
+    const apiKey = document.getElementById('api-key').value.trim();
+    const apiSecret = document.getElementById('api-secret').value.trim();
+    const msgEl = document.getElementById('msg-keys');
+    const btn = document.getElementById('btn-validate');
+
+    msgEl.className = 'msg';
+    msgEl.style.display = 'none';
+
+    if (!apiKey || !apiSecret) {
+      msgEl.className = 'msg error';
+      msgEl.textContent = 'Please enter both your API Key and API Secret.';
+      msgEl.style.display = 'block';
+      return;
+    }
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Validating…';
+
+    try {
+      const res = await fetch('/api/setup/validate-keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: apiKey, api_secret: apiSecret })
+      });
+      const data = await res.json();
+
+      if (data.ok) {
+        validatedKeys = true;
+        const btc = parseFloat(data.balances.btc).toFixed(8);
+        const usd = parseFloat(data.balances.usd).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        msgEl.className = 'msg success';
+        msgEl.innerHTML = '✓ Connected — BTC: ' + btc + ', USD: $' + usd;
+        msgEl.style.display = 'block';
+        btn.textContent = 'Connected ✓';
+
+        setTimeout(() => goTo(3), 1200);
+      } else {
+        msgEl.className = 'msg error';
+        msgEl.textContent = data.error || 'Failed to validate keys. Please check and try again.';
+        msgEl.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Validate Keys →';
+      }
+    } catch (err) {
+      msgEl.className = 'msg error';
+      msgEl.textContent = 'Network error — could not reach the server. Please try again.';
+      msgEl.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'Validate Keys →';
+    }
+  }
+
+  // ── Convert Local Time to UTC ──────────────────────────
+  function localTimeToUtc(timeStr) {
+    const [h, m] = timeStr.split(':').map(Number);
+    const d = new Date();
+    d.setHours(h, m, 0, 0);
+    return d.getUTCHours().toString().padStart(2, '0') + ':' + d.getUTCMinutes().toString().padStart(2, '0');
+  }
+
+  // ── Complete Setup ─────────────────────────────────────
+  async function completeSetup() {
+    const pw = document.getElementById('dash-pw').value;
+    const pwConfirm = document.getElementById('dash-pw-confirm').value;
+    const msgEl = document.getElementById('msg-complete');
+    const btn = document.getElementById('btn-complete');
+
+    msgEl.className = 'msg';
+    msgEl.style.display = 'none';
+
+    if (!pw) {
+      msgEl.className = 'msg error';
+      msgEl.textContent = 'Please enter a password.';
+      msgEl.style.display = 'block';
+      return;
+    }
+    if (pw !== pwConfirm) {
+      msgEl.className = 'msg error';
+      msgEl.textContent = 'Passwords do not match. Please try again.';
+      msgEl.style.display = 'block';
+      return;
+    }
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Saving…';
+
+    const freq = document.getElementById('dca-freq').value;
+    const payload = {
+      api_key: document.getElementById('api-key').value.trim(),
+      api_secret: document.getElementById('api-secret').value.trim(),
+      dashboard_password: pw,
+      dca_amount: parseFloat(document.getElementById('dca-amount').value),
+      dca_frequency: freq,
+      dca_day: freq === 'weekly' ? document.getElementById('dca-day').value : null,
+      dca_day_of_month: freq === 'monthly' ? parseInt(document.getElementById('dca-dom').value) : null,
+      dca_time_utc: localTimeToUtc(document.getElementById('dca-time').value),
+      mode: selectedMode,
+      paper_trading: paperTrading
+    };
+
+    try {
+      const res = await fetch('/api/setup/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+
+      if (data.ok) {
+        document.getElementById('server-ip').textContent = window.location.hostname;
+        if (paperTrading) {
+          document.getElementById('paper-note').style.display = '';
+        }
+        goTo('success');
+      } else {
+        msgEl.className = 'msg error';
+        msgEl.textContent = data.error || 'Setup failed. Please try again.';
+        msgEl.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Complete Setup →';
+      }
+    } catch (err) {
+      msgEl.className = 'msg error';
+      msgEl.textContent = 'Network error — could not reach the server. Please try again.';
+      msgEl.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'Complete Setup →';
+    }
+  }
+</script>
+</body>
+</html>
