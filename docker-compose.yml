@@ -29,6 +29,8 @@ services:
       - ./.env:/app/.env
       - ./VERSION:/app/VERSION:ro
       - ./update.sh:/app/update.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
     logging:
       driver: "json-file"
       options:

@@ -782,10 +782,14 @@ def update():
     if not update_script.exists():
         return jsonify({"ok": False, "error": "Update script not found on server"}), 500
     try:
+        # Use nohup + setsid so the script runs as a new session on the host
+        # and survives when this container shuts down during the rebuild
         subprocess.Popen(
-            ["/bin/bash", str(update_script)],
+            ["nohup", "/bin/bash", str(update_script)],
             stdout=open("/app/data/update.log", "w"),
             stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
             close_fds=True
         )
         return jsonify({
