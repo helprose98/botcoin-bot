@@ -27,6 +27,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./.env:/app/.env
+      - ./VERSION:/app/VERSION:ro
+      - ./update.sh:/app/update.sh:ro
     logging:
       driver: "json-file"
       options:

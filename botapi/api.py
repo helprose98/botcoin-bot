@@ -725,5 +725,76 @@ def setup_complete():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# ── Version check (public — no auth) ─────────────────────────────────────────────
+
+GITHUB_RAW = "https://raw.githubusercontent.com/helprose98/botcoin-bot/main/VERSION"
+VERSION_PATH = Path("/app/VERSION")
+
+
+def _read_local_version() -> str:
+    try:
+        return VERSION_PATH.read_text().strip()
+    except Exception:
+        return "unknown"
+
+
+def _fetch_latest_version() -> str | None:
+    try:
+        req = urllib.request.Request(GITHUB_RAW, headers={"User-Agent": "BotCoin/2.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
+def _version_gt(a: str, b: str) -> bool:
+    """Return True if version a is greater than version b."""
+    try:
+        return tuple(int(x) for x in a.split(".")) > tuple(int(x) for x in b.split("."))
+    except Exception:
+        return False
+
+
+@app.route("/api/version")
+def version():
+    """Public endpoint — returns current version and checks GitHub for updates."""
+    current = _read_local_version()
+    latest  = _fetch_latest_version()
+    update_available = latest is not None and _version_gt(latest, current)
+    return jsonify({
+        "current":          current,
+        "latest":           latest or current,
+        "update_available": update_available,
+    })
+
+
+# ── Update (auth required) ──────────────────────────────────────────────────────
+
+@app.route("/api/update", methods=["POST"])
+@requires_auth
+def update():
+    """
+    Pull latest code from GitHub and rebuild containers.
+    Runs /app/update.sh in the background — bot will restart automatically.
+    """
+    import subprocess
+    update_script = Path("/app/update.sh")
+    if not update_script.exists():
+        return jsonify({"ok": False, "error": "Update script not found on server"}), 500
+    try:
+        subprocess.Popen(
+            ["/bin/bash", str(update_script)],
+            stdout=open("/app/data/update.log", "w"),
+            stderr=subprocess.STDOUT,
+            close_fds=True
+        )
+        return jsonify({
+            "ok":      True,
+            "message": "Update started. Bot will restart in ~2 minutes. Refresh the dashboard."
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8081, debug=False)
