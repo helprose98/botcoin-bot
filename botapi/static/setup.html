@@ -820,7 +820,7 @@
       dca_day_of_month: freq === 'monthly' ? parseInt(document.getElementById('dca-dom').value) : null,
       dca_time_utc: localTimeToUtc(document.getElementById('dca-time').value),
       mode: selectedMode,
-      paper_trading: paperTrading
+      paper_trading: paperTrading ? 'true' : 'false'
     };
 
     try {
