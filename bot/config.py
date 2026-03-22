@@ -90,8 +90,75 @@ class Config:
     log_file:  str
 
 
+# All known .env keys with their safe defaults.
+# When new keys are added here, they get written to .env automatically on startup.
+_ENV_DEFAULTS = {
+    "TRADING_PAIR":                   "XBTUSD",
+    "MODE":                           "auto",
+    "DCA_AMOUNT_USD":                 "50.0",
+    "DCA_FREQUENCY":                  "weekly",
+    "DCA_DAY":                        "monday",
+    "DCA_DAY_OF_MONTH":               "1",
+    "DCA_TIME_UTC":                   "13:00",
+    "RECYCLER_POOL_PERCENT":          "0.35",
+    "DIP_THRESHOLD_PERCENT":          "0.07",
+    "DIP_BUY_DEPLOY_PERCENT":         "0.60",
+    "DIP_COOLDOWN_HOURS":             "12",
+    "DIP_TIER2_THRESHOLD_PERCENT":    "0.15",
+    "DIP_TIER2_DEPLOY_PERCENT":       "0.80",
+    "DIP_TIER3_THRESHOLD_PERCENT":    "0.22",
+    "DIP_TIER3_DEPLOY_PERCENT":       "1.00",
+    "RECYCLER_SELL_THRESHOLD_PERCENT":"0.18",
+    "RECYCLER_SELL_PERCENT":          "0.18",
+    "RECYCLER_SELL_COOLDOWN_HOURS":   "36",
+    "RECYCLER_REBUY_DROP_PERCENT":    "0.08",
+    "KRAKEN_MAKER_FEE":               "0.0025",
+    "MIN_USD_RESERVE":                "10.0",
+    "MIN_ORDER_USD":                  "5.0",
+    "MAX_ORDER_USD":                  "2000.0",
+    "PAPER_TRADING":                  "true",
+    "LOG_LEVEL":                      "INFO",
+    "LOG_FILE":                       "/app/data/bot.log",
+}
+
+
+def _sync_env_defaults(env_path: str = "/app/.env"):
+    """
+    Write any missing keys to .env with safe defaults.
+    Existing values are never overwritten — only missing keys are added.
+    API keys and passwords are never touched.
+    Called once on startup after credentials are confirmed present.
+    """
+    import pathlib
+    path = pathlib.Path(env_path)
+    if not path.exists():
+        return
+    try:
+        existing_keys = set()
+        lines = path.read_text().splitlines()
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                existing_keys.add(line.split("=", 1)[0].strip())
+
+        missing = {k: v for k, v in _ENV_DEFAULTS.items() if k not in existing_keys}
+        if missing:
+            with path.open("a") as f:
+                f.write("\n# Auto-added defaults (new in this version)\n")
+                for k, v in missing.items():
+                    f.write(f"{k}={v}\n")
+                    os.environ.setdefault(k, v)
+            logger.info("[config] Added %d new default keys to .env: %s",
+                        len(missing), list(missing.keys()))
+    except Exception as e:
+        logger.warning("[config] Could not sync .env defaults: %s", e)
+
+
 def load_config() -> Config:
     """Load config from environment variables (populated from .env by Docker)."""
+    # Sync any missing keys to .env with safe defaults before loading
+    _sync_env_defaults()
+
     cfg = Config(
         api_key    = _get("KRAKEN_API_KEY",    required=True),
         api_secret = _get("KRAKEN_API_SECRET", required=True),
