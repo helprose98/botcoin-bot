@@ -91,7 +91,7 @@ All settings can be changed anytime from the dashboard.
 
 ## Step 4 — Connect the Dashboard
 
-Open BotCoin-Dash in your browser and enter:
+Open **[https://dash.mybotcoin.io](https://dash.mybotcoin.io)** in your browser and enter:
 - **Bot Server IP**: your bot server's IP address
 - **Password**: the password you set in the wizard
 
