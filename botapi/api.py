@@ -492,7 +492,7 @@ def status():
 @app.route("/api/trades")
 @requires_auth
 def trades():
-    rows = query("SELECT * FROM trades WHERE reason != 'onboarding' ORDER BY timestamp DESC LIMIT 50")
+    rows = query("SELECT * FROM trades WHERE reason != 'onboarding' ORDER BY timestamp DESC LIMIT 500")
     return jsonify([_format_trade(t) for t in rows])
 
 
