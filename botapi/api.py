@@ -452,6 +452,13 @@ def status():
     latest_price_row = query_one("SELECT price_usd FROM price_history ORDER BY timestamp DESC LIMIT 1")
     current_price    = latest_price_row["price_usd"] if latest_price_row else 0
 
+    # Recent high over last 7 days — used by dip-buy logic as reference
+    recent_high_row = query_one(
+        "SELECT MAX(price_usd) as high FROM price_history "
+        "WHERE timestamp >= datetime('now', '-7 days')"
+    )
+    recent_high = recent_high_row["high"] if recent_high_row and recent_high_row["high"] else current_price
+
     portfolio_value = btc_balance * current_price if current_price else 0
     pnl_pct = ((current_price - avg_basis) / avg_basis * 100) if avg_basis and current_price else 0
 
@@ -478,6 +485,7 @@ def status():
             "waiting_rebuy":   waiting_rebuy,
             "waiting_resell":  waiting_resell,
             "last_switch":     last_switch_ts,
+            "recent_high":     round(recent_high, 2) if recent_high else None,
         },
         "mood":       mood,
         "last_trade": _format_trade(last_trade),
