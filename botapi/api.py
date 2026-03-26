@@ -504,6 +504,56 @@ def trades():
     return jsonify([_format_trade(t) for t in rows])
 
 
+@app.route("/api/open_orders")
+@requires_auth
+def open_orders():
+    """Fetch open (unfilled) limit orders from Kraken."""
+    try:
+        env        = _read_env()
+        api_key    = env.get("KRAKEN_API_KEY", "").strip()
+        api_secret = env.get("KRAKEN_API_SECRET", "").strip()
+        if not api_key or not api_secret:
+            return jsonify({"open_orders": []})
+
+        urlpath = "/0/private/OpenOrders"
+        nonce   = str(int(time.time() * 1000))
+        data    = {"nonce": nonce}
+        post    = urllib.parse.urlencode(data).encode()
+        sig     = _kraken_sign(urlpath, data, api_secret)
+
+        req = urllib.request.Request(
+            "https://api.kraken.com" + urlpath,
+            data=post,
+            headers={
+                "API-Key":  api_key,
+                "API-Sign": sig,
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+
+        if result.get("error"):
+            return jsonify({"open_orders": []})
+
+        orders = result.get("result", {}).get("open", {})
+        parsed = []
+        for txid, o in orders.items():
+            desc = o.get("descr", {})
+            parsed.append({
+                "txid":   txid,
+                "type":   desc.get("type", ""),       # buy / sell
+                "price":  desc.get("price", ""),       # limit price
+                "volume": o.get("vol", ""),            # BTC volume
+                "filled": o.get("vol_exec", "0"),      # filled so far
+                "status": o.get("status", ""),
+                "pair":   desc.get("pair", ""),
+            })
+        return jsonify({"open_orders": parsed})
+    except Exception as e:
+        return jsonify({"open_orders": [], "error": str(e)})
+
+
 # ── Settings GET (auth required) ──────────────────────────────────────────────
 
 @app.route("/api/settings", methods=["GET"])
