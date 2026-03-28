@@ -389,6 +389,14 @@ def _btc_stack_history():
 
 # ── Setup wizard page ──────────────────────────────────────────────────
 
+@app.route("/about")
+def about_page():
+    return send_from_directory(app.static_folder, "about.html")
+
+@app.route("/setup-guide")
+def setup_guide_page():
+    return send_from_directory(app.static_folder, "setup-guide.html")
+
 @app.route("/")
 @app.route("/setup")
 def setup_page():
