@@ -181,7 +181,7 @@ def load_config() -> Config:
         dip_tier3_threshold = _float("DIP_TIER3_THRESHOLD_PERCENT", 0.30),
         dip_tier3_deploy    = _float("DIP_TIER3_DEPLOY_PERCENT", 1.00),
 
-        recycler_sell_threshold_pct  = _float("RECYCLER_SELL_THRESHOLD_PERCENT", 0.40),
+        recycler_sell_threshold_pct  = _float("RECYCLER_SELL_THRESHOLD_PERCENT", 0.18),
         recycler_sell_pct            = _float("RECYCLER_SELL_PERCENT", 0.10),
         recycler_sell_cooldown_hours = _int("RECYCLER_SELL_COOLDOWN_HOURS", 72),
         recycler_rebuy_drop_pct      = _float("RECYCLER_REBUY_DROP_PERCENT", 0.15),

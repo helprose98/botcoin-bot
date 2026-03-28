@@ -33,7 +33,12 @@ app = Flask(__name__, static_folder="static")
 
 # Allow requests from any origin — dashboard server IP restriction
 # is enforced at the firewall level (Vultr firewall rules)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Restrict CORS to the known dashboard origin — defence in depth on top of firewall
+CORS(app, resources={r"/api/*": {"origins": [
+    "https://dash.mybotcoin.io",
+    "http://localhost",
+    "http://127.0.0.1",
+]}})
 
 DB_PATH  = Path("/app/data/bot.db")
 ENV_PATH = Path("/app/.env")
@@ -133,7 +138,6 @@ def requires_auth(f):
             return jsonify({"error": "Too many failed attempts. Try again in 60 seconds."}), 429
 
         password = (request.headers.get("X-Bot-Password") or
-                    request.args.get("pw") or
                     (request.get_json(force=True, silent=True) or {}).get("password", ""))
 
         if not password or not _check_auth(password):
@@ -716,6 +720,10 @@ def quick_buy():
 
 @app.route("/api/setup/validate-keys", methods=["POST"])
 def setup_validate_keys():
+    # Block if already configured — prevents credential overwrite attacks
+    if ENV_PATH.exists() and bool(_read_env().get("KRAKEN_API_KEY", "").strip()):
+        return jsonify({"ok": False, "error": "Bot already configured."}), 403
+
     # Rate limit by IP even without auth
     ip = request.remote_addr
     if not _check_rate_limit(ip):
@@ -763,6 +771,10 @@ def setup_validate_keys():
 
 @app.route("/api/setup/complete", methods=["POST"])
 def setup_complete():
+    # Block if already configured — prevents credential overwrite attacks
+    if ENV_PATH.exists() and bool(_read_env().get("KRAKEN_API_KEY", "").strip()):
+        return jsonify({"ok": False, "error": "Bot already configured. Use /api/settings to update."}), 403
+
     body = request.get_json(force=True)
     required = ["api_key", "api_secret", "dashboard_password", "dca_amount", "dca_day", "mode"]
     for field in required:

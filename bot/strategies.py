@@ -139,8 +139,8 @@ def btc_check_dip_buy(cfg: Config, current_price: float,
     else:
         return None
 
-    if _hours_since_last("dip_buy_tier1") < cfg.dip_cooldown_hours and \
-       _hours_since_last("dip_buy_tier2") < cfg.dip_cooldown_hours and \
+    if _hours_since_last("dip_buy_tier1") < cfg.dip_cooldown_hours or \
+       _hours_since_last("dip_buy_tier2") < cfg.dip_cooldown_hours or \
        _hours_since_last("dip_buy_tier3") < cfg.dip_cooldown_hours:
         logger.debug("BTC dip tier %d: cooldown active", tier)
         return None
@@ -284,8 +284,8 @@ def usd_check_spike_sell(cfg: Config, current_price: float,
     else:
         return None
 
-    if _hours_since_last("usd_spike_sell_tier1") < cfg.dip_cooldown_hours and \
-       _hours_since_last("usd_spike_sell_tier2") < cfg.dip_cooldown_hours and \
+    if _hours_since_last("usd_spike_sell_tier1") < cfg.dip_cooldown_hours or \
+       _hours_since_last("usd_spike_sell_tier2") < cfg.dip_cooldown_hours or \
        _hours_since_last("usd_spike_sell_tier3") < cfg.dip_cooldown_hours:
         logger.debug("USD spike tier %d: cooldown active", tier)
         return None
