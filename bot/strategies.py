@@ -146,10 +146,14 @@ def btc_check_dip_buy(cfg: Config, current_price: float,
         return None
 
     recycler_pool = usd_balance * cfg.recycler_pool_percent
+    # Hard cap: never try to spend more than 90% of current balance
+    # Protects against stale balance reads where Kraken hasn't settled yet
+    hard_cap = (usd_balance - cfg.min_usd_reserve) * 0.90
     usd_to_deploy = max(cfg.min_order_usd,
                         min(recycler_pool * deploy_pct,
                             cfg.max_order_usd,
-                            usd_balance - cfg.min_usd_reserve))
+                            usd_balance - cfg.min_usd_reserve,
+                            hard_cap))
 
     if usd_to_deploy < cfg.min_order_usd:
         logger.warning("BTC dip buy: recycler pool too small ($%.2f)", recycler_pool)
