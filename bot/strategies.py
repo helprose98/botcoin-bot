@@ -218,7 +218,10 @@ def btc_check_recycler_rebuy(cfg: Config, current_price: float,
         return None
 
     recycler_pool = usd_balance * cfg.recycler_pool_percent
-    usd_to_spend  = max(cfg.min_order_usd, min(recycler_pool, cfg.max_order_usd))
+    # Same hard cap as dip buy — never spend more than 90% of actual balance
+    hard_cap = (usd_balance - cfg.min_usd_reserve) * 0.90
+    usd_to_spend  = max(cfg.min_order_usd,
+                        min(recycler_pool, cfg.max_order_usd, hard_cap))
     if usd_to_spend < cfg.min_order_usd:
         return None
 

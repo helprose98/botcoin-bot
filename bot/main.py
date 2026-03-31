@@ -144,21 +144,24 @@ def execute_buy(client: KrakenClient, current_price: float, usd_amount: float,
         if not order:
             return False
 
-        prev_btc  = snapshot["btc_balance"]    if snapshot else 0.0
         prev_cost = snapshot["avg_cost_basis"] if snapshot else 0.0
         prev_fees = snapshot["total_fees_paid"] if snapshot else 0.0
         order_cost = order["usd_amount"] + order["fee_usd"]
 
-        new_btc   = prev_btc + order["btc_amount"]
-        new_basis = ((prev_btc * prev_cost) + order_cost) / new_btc if new_btc > 0 else order["price"]
-
+        # Fetch live balances to update snapshot accurately
         try:
             balances = client.get_balance()
             live_btc = balances["BTC"]
             live_usd = balances["USD"]
         except Exception:
-            live_btc = new_btc
+            # Fall back: estimate from snapshot
+            live_btc = (snapshot["btc_balance"] if snapshot else 0.0) + order["btc_amount"]
             live_usd = max(0.0, (snapshot["usd_balance"] if snapshot else 0) - usd_amount)
+
+        # Cost basis uses live BTC balance (most accurate denominator)
+        prev_btc  = max(0.0, live_btc - order["btc_amount"])  # what we had before this buy
+        new_btc   = live_btc
+        new_basis = ((prev_btc * prev_cost) + order_cost) / new_btc if new_btc > 0 else order["price"]
 
         trade_id = record_trade(
             order_id    = order["order_id"],
@@ -287,8 +290,16 @@ def run_btc_accumulate_strategies(client, current_price, snapshot, active_mode):
 
 def run_usd_accumulate_strategies(client, current_price, snapshot, active_mode):
     """Run all USD accumulation strategy checks in priority order (inverted)."""
-    btc_balance   = snapshot["btc_balance"]    if snapshot else 0.0
-    usd_balance   = snapshot["usd_balance"]    if snapshot else 0.0
+    # Same as BTC mode — always use live Kraken balances, not stale snapshot
+    try:
+        live_balances = client.get_balance()
+        btc_balance = live_balances["BTC"]
+        usd_balance = live_balances["USD"]
+        logger.debug("Live balances: BTC=%.8f USD=$%.2f", btc_balance, usd_balance)
+    except Exception as e:
+        logger.warning("Could not fetch live balance, falling back to snapshot: %s", e)
+        btc_balance = snapshot["btc_balance"] if snapshot else 0.0
+        usd_balance = snapshot["usd_balance"] if snapshot else 0.0
     avg_sell_basis = get_usd_avg_sell_basis()
 
     # Priority 1: Recycler resell (BTC is waiting to be resold at bounce)
