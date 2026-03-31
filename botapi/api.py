@@ -319,13 +319,13 @@ def _format_trade(t):
     if not t:
         return None
     reason_labels = {
-        "dca":                  "Weekly DCA Buy",
+        "dca":                  "DCA Buy",
         "dip_buy_tier1":        "Dip Buy (Tier 1 — 7%+ drop)",
         "dip_buy_tier2":        "Dip Buy (Tier 2 — 15%+ drop)",
         "dip_buy_tier3":        "Dip Buy (Tier 3 — 22%+ crash)",
         "recycler_sell":        "Recycler Sell (taking profit)",
         "recycler_rebuy":       "Recycler Rebuy (buying back cheaper)",
-        "usd_dca_sell":         "Weekly DCA Sell",
+        "usd_dca_sell":         "DCA Sell",
         "usd_spike_sell_tier1": "Spike Sell (Tier 1 — 7%+ rise)",
         "usd_spike_sell_tier2": "Spike Sell (Tier 2 — 15%+ rise)",
         "usd_spike_sell_tier3": "Spike Sell (Tier 3 — 22%+ pump)",
