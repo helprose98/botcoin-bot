@@ -9,11 +9,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot source code
+# Copy bot source code and scripts
 COPY bot/ ./bot/
+COPY scripts/ ./scripts/
+COPY entrypoint.sh ./entrypoint.sh
 
 # Create data and log directories
-RUN mkdir -p /app/data /app/logs
+RUN mkdir -p /app/data /app/logs && chmod +x /app/entrypoint.sh
 
-# Run the bot
-CMD ["python", "bot/main.py"]
+# Run via entrypoint (seeds price history, then starts bot)
+CMD ["/app/entrypoint.sh"]
