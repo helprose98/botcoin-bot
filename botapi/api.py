@@ -266,6 +266,24 @@ def _get_live_balances():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _get_live_price() -> float | None:
+    """Fetch the current BTC price from Kraken public ticker. No auth required."""
+    try:
+        req = urllib.request.Request(
+            "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+            headers={"User-Agent": "BotCoin/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read())
+        if body.get("error"):
+            return None
+        result = body.get("result", {})
+        price = float(list(result.values())[0]["c"][0])  # last trade price
+        return round(price, 2)
+    except Exception:
+        return None
+
+
 def _get_200ma():
     rows = query("SELECT price_usd FROM daily_prices ORDER BY date DESC LIMIT 200")
     if len(rows) < 10:
@@ -461,8 +479,11 @@ def status():
         if live["btc"] > 0:
             btc_balance = live["btc"]
 
+    # Live price from Kraken ticker (sync with bot's 5-min loop)
+    # Fall back to last DB sample if the ticker call fails
+    live_price = _get_live_price()
     latest_price_row = query_one("SELECT price_usd FROM price_history ORDER BY timestamp DESC LIMIT 1")
-    current_price    = latest_price_row["price_usd"] if latest_price_row else 0
+    current_price = live_price if live_price else (latest_price_row["price_usd"] if latest_price_row else 0)
 
     # Recent high over last 7 days — used by dip-buy logic as reference
     recent_high_row = query_one(
