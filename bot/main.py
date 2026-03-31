@@ -244,8 +244,18 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
 
 def run_btc_accumulate_strategies(client, current_price, snapshot, active_mode):
     """Run all BTC accumulation strategy checks in priority order."""
-    btc_balance = snapshot["btc_balance"]    if snapshot else 0.0
-    usd_balance = snapshot["usd_balance"]    if snapshot else 0.0
+    # Always fetch live balances from Kraken — never trust stale snapshot values.
+    # The snapshot can lag after failed orders (e.g. EOrder:Insufficient funds)
+    # causing the bot to repeatedly attempt orders it can't afford.
+    try:
+        live_balances = client.get_balance()
+        btc_balance = live_balances["BTC"]
+        usd_balance = live_balances["USD"]
+        logger.debug("Live balances: BTC=%.8f USD=$%.2f", btc_balance, usd_balance)
+    except Exception as e:
+        logger.warning("Could not fetch live balance, falling back to snapshot: %s", e)
+        btc_balance = snapshot["btc_balance"]    if snapshot else 0.0
+        usd_balance = snapshot["usd_balance"]    if snapshot else 0.0
     avg_cost    = snapshot["avg_cost_basis"] if snapshot else 0.0
 
     # Priority 1: Recycler rebuy (cash is sitting waiting, deploy it)
