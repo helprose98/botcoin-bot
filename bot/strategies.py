@@ -102,13 +102,15 @@ def btc_check_dca(cfg: Config, usd_balance: float) -> dict | None:
         logger.debug("BTC DCA: already executed this %s", cfg.dca_frequency)
         return None
 
-    recycler_reserve = usd_balance * cfg.recycler_pool_percent
-    dca_pool         = usd_balance - recycler_reserve - cfg.min_usd_reserve
-    amount           = max(cfg.min_order_usd,
-                           min(cfg.dca_amount_usd, dca_pool, cfg.max_order_usd))
+    # DCA is a fixed commitment — it does NOT compete with the recycler pool.
+    # As long as we have dca_amount + min_usd_reserve available, it fires.
+    # The recycler pool is for opportunistic dip buys, not a blocker for scheduled DCA.
+    available = usd_balance - cfg.min_usd_reserve
+    amount    = min(cfg.dca_amount_usd, available, cfg.max_order_usd)
 
     if amount < cfg.min_order_usd:
-        logger.warning("BTC DCA: insufficient funds. DCA pool: $%.2f", dca_pool)
+        logger.warning("BTC DCA: insufficient funds (balance=$%.2f, reserve=$%.2f)",
+                       usd_balance, cfg.min_usd_reserve)
         return None
 
     logger.info("BTC DCA triggered: $%.2f", amount)
@@ -248,19 +250,15 @@ def usd_check_dca(cfg: Config, current_price: float,
         logger.debug("USD DCA: already executed this %s", cfg.dca_frequency)
         return None
 
-    # How much BTC to sell to get cfg.dca_amount_usd worth
-    btc_reserve     = btc_balance * cfg.recycler_pool_percent
-    available_btc   = btc_balance - btc_reserve
-    target_btc      = cfg.dca_amount_usd / current_price
-
-    btc_to_sell = min(target_btc, available_btc)
+    # DCA sell is a fixed commitment — does not compete with the recycler BTC pool.
+    # Use full BTC balance minus a small dust reserve.
+    target_btc  = cfg.dca_amount_usd / current_price
     min_btc     = cfg.min_order_usd / current_price
     max_btc     = cfg.max_order_usd / current_price
+    btc_to_sell = max(min_btc, min(target_btc, btc_balance, max_btc))
 
-    btc_to_sell = max(min_btc, min(btc_to_sell, max_btc))
-
-    if btc_to_sell < min_btc:
-        logger.warning("USD DCA: insufficient BTC. Available: %.8f BTC", available_btc)
+    if btc_to_sell < min_btc or btc_balance <= 0:
+        logger.warning("USD DCA: insufficient BTC. Balance: %.8f BTC", btc_balance)
         return None
 
     logger.info("USD DCA triggered: sell %.8f BTC (~$%.2f)", btc_to_sell,
