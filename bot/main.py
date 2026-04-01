@@ -320,11 +320,10 @@ def run_usd_accumulate_strategies(client, current_price, snapshot, active_mode):
         return execute_sell(client, current_price, action["btc_amount"],
                             action["reason"], active_mode, snapshot)
 
-    # Priority 4: Scheduled DCA sell
-    action = usd_check_dca(cfg, current_price, btc_balance)
-    if action:
-        return execute_sell(client, current_price, action["btc_amount"],
-                            action["reason"], active_mode, snapshot)
+    # DCA is intentionally suspended during USD accumulation mode.
+    # DCA means "buy BTC on a schedule" — it doesn't invert.
+    # The recycler and spike-sell system handles USD accumulation trading.
+    logger.debug("USD mode: DCA halted — resumes when bot switches to BTC accumulation")
 
     return False
 
