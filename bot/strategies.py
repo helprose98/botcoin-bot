@@ -50,12 +50,17 @@ def _round_trip_fee_cost(amount_usd: float, maker_fee: float) -> float:
 def _is_dca_due(reason: str, cfg: Config) -> bool:
     """
     Return True if a DCA trade is due based on the configured frequency.
-    - daily:   hasn't fired yet today (UTC calendar date)
+    - daily:   hasn't fired since the last scheduled time passed
     - weekly:  hasn't fired in the last 6 days
     - monthly: hasn't fired in the last 27 days
 
-    Daily uses calendar-day comparison so rescheduling to an earlier
-    time never causes the 23h cooldown to block the trade.
+    Daily logic: calculate the most recent past occurrence of the
+    scheduled time, then check if the last trade pre-dates it.
+    This means:
+      - Fires once per day at the scheduled time
+      - If you reschedule to a future time, it fires when that time arrives
+      - If you reschedule to an earlier time that already passed today,
+        it fires immediately (correct — the window was missed)
     """
     trade = get_last_trade_by_reason(reason)
     if not trade:
@@ -64,8 +69,20 @@ def _is_dca_due(reason: str, cfg: Config) -> bool:
     now_utc = datetime.now(timezone.utc)
 
     if cfg.dca_frequency == "daily":
-        # Fire if the last DCA was on a different UTC calendar day
-        return last_ts.date() < now_utc.date()
+        # Due if no DCA has fired today (UTC date) at or after the scheduled time.
+        # This means:
+        #   - Set to 3pm, it's 2pm  -> last_scheduled is today at 3pm, hasn't passed -> not due yet
+        #   - Set to 3pm, it's 3pm  -> window open, and no trade today at/after 3pm -> due
+        #   - Set to 3pm, fired at 3pm, reschedule to 4pm -> no trade today at/after 4pm -> due again
+        #   - Normal daily use -> fires once, next day fires again
+        hour, minute = map(int, cfg.dca_time_utc.split(":"))
+        scheduled_today = now_utc.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        # Has it fired today at or after the scheduled time?
+        fired_since_scheduled = (
+            last_ts.date() == now_utc.date() and
+            last_ts >= scheduled_today
+        )
+        return not fired_since_scheduled
     else:
         min_hours = {"weekly": 6 * 24, "monthly": 27 * 24}.get(cfg.dca_frequency, 6 * 24)
         hours_elapsed = (now_utc - last_ts).total_seconds() / 3600
