@@ -50,17 +50,26 @@ def _round_trip_fee_cost(amount_usd: float, maker_fee: float) -> float:
 def _is_dca_due(reason: str, cfg: Config) -> bool:
     """
     Return True if a DCA trade is due based on the configured frequency.
-    - daily:   hasn't fired in the last 23h
+    - daily:   hasn't fired yet today (UTC calendar date)
     - weekly:  hasn't fired in the last 6 days
     - monthly: hasn't fired in the last 27 days
+
+    Daily uses calendar-day comparison so rescheduling to an earlier
+    time never causes the 23h cooldown to block the trade.
     """
-    min_hours = {"daily": 23, "weekly": 6 * 24, "monthly": 27 * 24}.get(cfg.dca_frequency, 6 * 24)
     trade = get_last_trade_by_reason(reason)
     if not trade:
         return True
     last_ts = datetime.fromisoformat(trade["timestamp"]).replace(tzinfo=timezone.utc)
-    hours_elapsed = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600
-    return hours_elapsed >= min_hours
+    now_utc = datetime.now(timezone.utc)
+
+    if cfg.dca_frequency == "daily":
+        # Fire if the last DCA was on a different UTC calendar day
+        return last_ts.date() < now_utc.date()
+    else:
+        min_hours = {"weekly": 6 * 24, "monthly": 27 * 24}.get(cfg.dca_frequency, 6 * 24)
+        hours_elapsed = (now_utc - last_ts).total_seconds() / 3600
+        return hours_elapsed >= min_hours
 
 
 def _in_dca_window(cfg: Config) -> bool:
