@@ -881,6 +881,159 @@ def version():
 
 # ── Update (auth required) ──────────────────────────────────────────────────────
 
+
+
+# ── DCA Baseline (auth required) ──────────────────────────────────────────────
+
+@app.route("/api/dca_baseline")
+@requires_auth
+def dca_baseline():
+    """
+    Compute a shadow 'pure DCA' portfolio alongside the real bot portfolio.
+    Shadow portfolio: only executes the configured DCA schedule from the
+    bot's first recorded trade date. No dip buys, no recycler, no quick buys.
+    """
+    import math
+    from datetime import datetime, timezone, timedelta
+
+    env = _read_env()
+    dca_amount  = float(env.get("DCA_AMOUNT_USD", "10.0"))
+    dca_freq    = env.get("DCA_FREQUENCY", "daily").lower()
+    current_price = _get_live_price()
+    if not current_price:
+        row = query_one("SELECT price_usd FROM price_history ORDER BY timestamp DESC LIMIT 1")
+        current_price = row["price_usd"] if row else 0
+    if not current_price:
+        return jsonify({"ok": False, "error": "No price data available"}), 503
+
+    first_trade = query_one(
+        "SELECT timestamp FROM trades WHERE reason != 'onboarding' ORDER BY timestamp ASC LIMIT 1"
+    )
+    if not first_trade:
+        return jsonify({"ok": False, "error": "No trades recorded yet"}), 404
+
+    start_dt = datetime.fromisoformat(first_trade["timestamp"]).replace(tzinfo=timezone.utc)
+    now_utc  = datetime.now(timezone.utc)
+
+    # Build shadow DCA dates
+    shadow_dates = []
+    cursor = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    if dca_freq == "daily":
+        while cursor <= now_utc:
+            shadow_dates.append(cursor)
+            cursor += timedelta(days=1)
+    elif dca_freq == "weekly":
+        while cursor <= now_utc:
+            shadow_dates.append(cursor)
+            cursor += timedelta(weeks=1)
+    elif dca_freq == "monthly":
+        while cursor <= now_utc:
+            shadow_dates.append(cursor)
+            month = cursor.month + 1
+            year  = cursor.year + (month - 1) // 12
+            month = ((month - 1) % 12) + 1
+            try:
+                cursor = cursor.replace(year=year, month=month)
+            except ValueError:
+                import calendar
+                last_day = calendar.monthrange(year, month)[1]
+                cursor = cursor.replace(year=year, month=month, day=last_day)
+
+    # Build price map from DB
+    price_map = {}
+    for r in query("SELECT DATE(date) as d, price_usd FROM daily_prices ORDER BY date ASC"):
+        price_map[r["d"]] = r["price_usd"]
+    for r in query("SELECT DATE(timestamp) as d, AVG(price_usd) as price_usd FROM price_history GROUP BY DATE(timestamp)"):
+        if r["d"] not in price_map:
+            price_map[r["d"]] = r["price_usd"]
+
+    def nearest_price(dt):
+        target = dt.strftime("%Y-%m-%d")
+        if target in price_map:
+            return price_map[target]
+        for delta in range(1, 8):
+            for sign in (-1, 1):
+                key = (dt + timedelta(days=delta * sign)).strftime("%Y-%m-%d")
+                if key in price_map:
+                    return price_map[key]
+        return current_price
+
+    # Simulate shadow portfolio
+    shadow_btc = 0.0
+    shadow_spent = 0.0
+    shadow_fees = 0.0
+    maker_fee = 0.0016
+    for date in shadow_dates:
+        price = nearest_price(date)
+        if price and price > 0:
+            fee_usd    = dca_amount * maker_fee
+            net_usd    = dca_amount - fee_usd
+            shadow_btc   += net_usd / price
+            shadow_spent += dca_amount
+            shadow_fees  += fee_usd
+
+    # Real bot stats
+    all_trades = query("SELECT * FROM trades WHERE reason != 'onboarding' ORDER BY timestamp ASC")
+    real_btc_bought = 0.0
+    real_usd_spent  = 0.0
+    real_fees       = 0.0
+    recycler_btc    = 0.0
+    recycler_usd_gained = 0.0
+    for t in all_trades:
+        btc    = float(t["btc_amount"] or 0)
+        usd    = float(t["usd_amount"] or 0)
+        fee    = float(t["fee_usd"]    or 0)
+        reason = (t["reason"] or "").lower()
+        side   = (t["side"]   or "").lower()
+        real_fees += fee
+        if side == "buy":
+            real_btc_bought += btc
+            if reason in ("recycler_rebuy", "usd_recycler_buy"):
+                recycler_btc += btc
+            else:
+                real_usd_spent += usd
+        elif side == "sell":
+            if "recycl" in reason or "spike" in reason or reason == "usd_dca_sell":
+                recycler_usd_gained += usd
+
+    snapshot = get_latest_snapshot()
+    live_btc = snapshot["btc_balance"] if snapshot else real_btc_bought
+
+    shadow_value = round(shadow_btc * current_price, 2)
+    real_value   = round(live_btc   * current_price, 2)
+    delta_btc    = round(live_btc - shadow_btc, 8)
+    delta_usd    = round(real_value - shadow_value, 2)
+
+    return jsonify({
+        "ok":            True,
+        "start_date":    start_dt.strftime("%Y-%m-%d"),
+        "dca_amount":    dca_amount,
+        "dca_frequency": dca_freq,
+        "days_running":  (now_utc - start_dt).days,
+        "current_price": round(current_price, 2),
+        "baseline": {
+            "btc":       round(shadow_btc, 8),
+            "usd_spent": round(shadow_spent, 2),
+            "fees":      round(shadow_fees, 4),
+            "value_usd": shadow_value,
+            "dca_count": len(shadow_dates),
+        },
+        "actual": {
+            "btc":       round(live_btc, 8),
+            "usd_spent": round(real_usd_spent, 2),
+            "fees":      round(real_fees, 4),
+            "value_usd": real_value,
+            "recycler_btc": round(recycler_btc, 8),
+            "recycler_usd_gained": round(recycler_usd_gained, 2),
+        },
+        "delta": {
+            "btc":           delta_btc,
+            "usd":           delta_usd,
+            "pct":           round((delta_usd / shadow_value * 100), 2) if shadow_value > 0 else 0,
+            "outperforming": delta_usd >= 0,
+        },
+    })
+
 @app.route("/api/update", methods=["POST"])
 @requires_auth
 def update():
