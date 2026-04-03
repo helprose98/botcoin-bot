@@ -893,9 +893,6 @@ def dca_baseline():
     Shadow portfolio: only executes the configured DCA schedule from the
     bot's first recorded trade date. No dip buys, no recycler, no quick buys.
     """
-    import math
-    from datetime import datetime, timezone, timedelta
-
     env = _read_env()
     dca_amount  = float(env.get("DCA_AMOUNT_USD", "10.0"))
     dca_freq    = env.get("DCA_FREQUENCY", "daily").lower()
@@ -996,8 +993,8 @@ def dca_baseline():
             if "recycl" in reason or "spike" in reason or reason == "usd_dca_sell":
                 recycler_usd_gained += usd
 
-    snapshot = get_latest_snapshot()
-    live_btc = snapshot["btc_balance"] if snapshot else real_btc_bought
+    snapshot = query_one("SELECT btc_balance, usd_balance FROM portfolio_snapshots ORDER BY timestamp DESC LIMIT 1")
+    live_btc = float(snapshot["btc_balance"]) if snapshot else real_btc_bought
 
     shadow_value = round(shadow_btc * current_price, 2)
     real_value   = round(live_btc   * current_price, 2)
