@@ -82,6 +82,11 @@ class Config:
     # Accumulation mode
     mode: str          # 'btc_accumulate', 'usd_accumulate', or 'auto'
 
+    # Sideways Market
+    sideways_enabled:       bool
+    range_trade_size_usd:   float
+    range_max_positions:    int
+
     # Mode
     paper_trading: bool
 
@@ -116,6 +121,9 @@ _ENV_DEFAULTS = {
     "MIN_USD_RESERVE":                "10.0",
     "MIN_ORDER_USD":                  "5.0",
     "MAX_ORDER_USD":                  "2000.0",
+    "SIDEWAYS_ENABLED":               "true",
+    "RANGE_TRADE_SIZE_USD":           "500",
+    "RANGE_MAX_POSITIONS":            "5",
     "PAPER_TRADING":                  "true",
     "LOG_LEVEL":                      "INFO",
     "LOG_FILE":                       "/app/data/bot.log",
@@ -193,6 +201,10 @@ def load_config() -> Config:
         max_order_usd   = _float("MAX_ORDER_USD", 500.0),
 
         mode = _get("MODE", "auto").lower(),
+
+        sideways_enabled     = _bool("SIDEWAYS_ENABLED", True),
+        range_trade_size_usd = _float("RANGE_TRADE_SIZE_USD", 500.0),
+        range_max_positions  = _int("RANGE_MAX_POSITIONS", 5),
 
         paper_trading = _bool("PAPER_TRADING", True),
 

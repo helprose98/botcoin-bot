@@ -107,7 +107,8 @@ logger = logging.getLogger("main")
 from database import (
     init_db, record_trade, save_portfolio_snapshot,
     get_latest_snapshot, record_price, record_daily_price, get_summary,
-    record_mode_switch
+    record_mode_switch, get_last_trade_by_reason,
+    add_range_position, close_range_position,
 )
 from kraken_client import KrakenClient, KrakenAPIError
 from onboarding import run_onboarding
@@ -121,6 +122,7 @@ from strategies import (
     usd_check_recycler_buy, usd_check_recycler_resell,
     get_usd_avg_sell_basis,
 )
+from sideways import check_sideways
 
 LOOP_INTERVAL_SECONDS  = 300   # Check every 5 minutes
 PRICE_SAMPLE_INTERVAL  = 900   # Record intraday price every 15 min
@@ -241,6 +243,50 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
     except Exception as e:
         logger.exception("Unexpected error on sell (%s): %s", reason, e)
         return False
+
+
+# ── Range Recycler execution ──────────────────────────────────────────────────
+
+def run_range_recycler(client, current_price, snapshot, active_mode):
+    """Execute Range Recycler actions from the sideways overlay."""
+    actions = check_sideways(cfg, current_price, active_mode)
+
+    for action in actions:
+        if action["type"] == "buy":
+            ok = execute_buy(client, current_price, action["usd_amount"],
+                             action["reason"], active_mode, snapshot)
+            if ok and "position_id" in action:
+                # Closing a USD-mode position (bought back cheaper)
+                close_range_position(action["position_id"])
+            elif ok:
+                # Opening a new BTC-mode position
+                btc_bought = action["usd_amount"] / current_price
+                trade_row = get_last_trade_by_reason("range_recycler_buy")
+                trade_id = trade_row["id"] if trade_row else None
+                add_range_position(
+                    trade_id=trade_id,
+                    buy_price=current_price,
+                    btc_amount=btc_bought,
+                    usd_amount=action["usd_amount"],
+                )
+
+        elif action["type"] == "sell":
+            ok = execute_sell(client, current_price, action["btc_amount"],
+                              action["reason"], active_mode, snapshot)
+            if ok and "position_id" in action:
+                # Closing a BTC-mode position (sold at profit)
+                close_range_position(action["position_id"])
+            elif ok:
+                # Opening a new USD-mode position (sold, will buy back cheaper)
+                usd_amount = action["btc_amount"] * current_price
+                trade_row = get_last_trade_by_reason("range_recycler_sell")
+                trade_id = trade_row["id"] if trade_row else None
+                add_range_position(
+                    trade_id=trade_id,
+                    buy_price=current_price,
+                    btc_amount=action["btc_amount"],
+                    usd_amount=usd_amount,
+                )
 
 
 # ── Strategy dispatch ─────────────────────────────────────────────────────────
@@ -438,6 +484,9 @@ def main():
             elif active_mode == Mode.USD_ACCUMULATE:
                 run_usd_accumulate_strategies(client, current_price, snapshot, active_mode)
             # AUTO mode is resolved to BTC or USD above — never reaches here as AUTO
+
+            # ── Sideways Market overlay (Range Recycler) ─────────────────────
+            run_range_recycler(client, current_price, snapshot, active_mode)
 
             consecutive_errors = 0
 

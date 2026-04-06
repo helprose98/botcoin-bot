@@ -89,12 +89,24 @@ def init_db():
                 updated_at      DATETIME NOT NULL DEFAULT (datetime('now'))
             );
 
+            -- Range Recycler positions (Sideways Market overlay)
+            CREATE TABLE IF NOT EXISTS range_positions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp       DATETIME NOT NULL DEFAULT (datetime('now')),
+                trade_id        INTEGER REFERENCES trades(id),
+                buy_price       REAL NOT NULL,
+                btc_amount      REAL NOT NULL,
+                usd_amount      REAL NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'open'  -- 'open', 'closed', 'converted'
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_price_history_ts  ON price_history(timestamp);
             CREATE INDEX IF NOT EXISTS idx_daily_prices_date ON daily_prices(date);
             CREATE INDEX IF NOT EXISTS idx_trades_ts         ON trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_trades_reason     ON trades(reason);
             CREATE INDEX IF NOT EXISTS idx_trades_mode       ON trades(active_mode);
+            CREATE INDEX IF NOT EXISTS idx_range_positions_status ON range_positions(status);
         """)
     logger.info("Database initialized at %s", DB_PATH)
 
@@ -256,6 +268,59 @@ def get_state(key: str, default=None):
             "SELECT value FROM bot_state WHERE key=?", (key,)
         ).fetchone()
     return row["value"] if row else default
+
+
+# ── Range positions (Sideways Market) ────────────────────────────────────────
+
+def add_range_position(trade_id: int, buy_price: float,
+                       btc_amount: float, usd_amount: float):
+    """Record a new open range recycler position."""
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO range_positions (trade_id, buy_price, btc_amount, usd_amount, status)
+            VALUES (?, ?, ?, ?, 'open')
+        """, (trade_id, buy_price, btc_amount, usd_amount))
+    logger.info("[RANGE] New position: %.8f BTC @ $%.2f ($%.2f)",
+                btc_amount, buy_price, usd_amount)
+
+
+def get_open_range_positions() -> list[dict]:
+    """Return all open range recycler positions."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM range_positions WHERE status='open' ORDER BY timestamp ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def close_range_position(position_id: int):
+    """Mark a range position as closed (sold for profit)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE range_positions SET status='closed' WHERE id=?",
+            (position_id,)
+        )
+    logger.info("[RANGE] Position %d closed", position_id)
+
+
+def convert_range_positions():
+    """Convert all open range positions to 'converted' (sideways ended, becomes normal recycler)."""
+    with get_connection() as conn:
+        count = conn.execute(
+            "UPDATE range_positions SET status='converted' WHERE status='open'"
+        ).rowcount
+    if count:
+        logger.info("[RANGE] Converted %d open positions to normal recycler", count)
+    return count
+
+
+def count_open_range_positions() -> int:
+    """Return count of open range recycler positions."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as c FROM range_positions WHERE status='open'"
+        ).fetchone()
+    return row["c"] if row else 0
 
 
 # ── Reporting ────────────────────────────────────────────────────────────────

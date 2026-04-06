@@ -349,6 +349,8 @@ def _format_trade(t):
         "usd_spike_sell_tier3": "Spike Sell (Tier 3 — 22%+ pump)",
         "usd_recycler_buy":     "Recycler Buy (buying dip for resell)",
         "usd_recycler_resell":  "Recycler Resell (selling bounce)",
+        "range_recycler_buy":   "Range Recycler Buy (sideways dip)",
+        "range_recycler_sell":  "Range Recycler Sell (sideways pop)",
         "onboarding":           "Onboarding (existing position)",
         "quick_buy":            "Quick Buy BTC (manual)",
     }
@@ -395,6 +397,41 @@ def _calculate_mood(mode, pnl_pct, current_price, ma200,
                 "detail": f"Down {abs(pnl_pct):.1f}% on basis. Every weekly buy is pulling your average down. Patience."}
     return {"icon": "💎", "label": "Hold & Stack", "color": "neutral",
             "detail": f"Down {abs(pnl_pct):.1f}% on basis. This is where DCA earns its keep. Keep stacking."}
+
+
+def _get_sideways_status():
+    """Build sideways status dict for the API response."""
+    env = _read_env()
+    enabled = env.get("SIDEWAYS_ENABLED", "true").lower() in ("true", "1", "yes")
+    is_active = _state("sideways_active", "false") == "true"
+    range_pct = _state("sideways_range_pct")
+    max_positions = int(env.get("RANGE_MAX_POSITIONS", "5"))
+
+    # Count open range positions
+    open_positions = 0
+    conn = get_db()
+    if conn:
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as c FROM range_positions WHERE status='open'"
+            ).fetchone()
+            open_positions = row["c"] if row else 0
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    return {
+        "active":             is_active and enabled,
+        "enabled":            enabled,
+        "range_pct":          round(float(range_pct), 2) if range_pct else None,
+        "window_days":        14,
+        "threshold_pct":      12,
+        "positions":          open_positions,
+        "max_positions":      max_positions,
+        "buy_threshold_pct":  -4,
+        "sell_threshold_pct": 6,
+    }
 
 
 def _btc_stack_history():
@@ -519,6 +556,7 @@ def status():
             "waiting_resell":  waiting_resell,
             "last_switch":     last_switch_ts,
             "recent_high":     round(recent_high, 2) if recent_high else None,
+            "sideways":        _get_sideways_status(),
         },
         "mood":       mood,
         "last_trade": _format_trade(last_trade),
@@ -607,6 +645,9 @@ def get_settings():
         "recycler_sell_threshold": env.get("RECYCLER_SELL_THRESHOLD_PERCENT", "0.18"),
         "recycler_pool_percent":   env.get("RECYCLER_POOL_PERCENT", "0.35"),
         "max_order_usd":     env.get("MAX_ORDER_USD", "1000.00"),
+        "sideways_enabled":      env.get("SIDEWAYS_ENABLED", "true"),
+        "range_trade_size_usd":  env.get("RANGE_TRADE_SIZE_USD", "500"),
+        "range_max_positions":   env.get("RANGE_MAX_POSITIONS", "5"),
     })
 
 
@@ -635,6 +676,9 @@ def save_settings():
         "RECYCLER_SELL_THRESHOLD_PERCENT": body.get("recycler_sell_threshold"),
         "RECYCLER_POOL_PERCENT":           body.get("recycler_pool_percent"),
         "MAX_ORDER_USD":                   body.get("max_order_usd"),
+        "SIDEWAYS_ENABLED":                body.get("sideways_enabled"),
+        "RANGE_TRADE_SIZE_USD":            body.get("range_trade_size_usd"),
+        "RANGE_MAX_POSITIONS":             body.get("range_max_positions"),
     }
     updates = {k: str(v) for k, v in allowed.items() if v is not None}
     try:
