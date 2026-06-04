@@ -507,7 +507,31 @@ def status():
     # Snapshot values as fallback
     btc_balance = snapshot["btc_balance"]    if snapshot else onboarding_btc
     usd_balance = snapshot["usd_balance"]    if snapshot else 0
-    avg_basis   = snapshot["avg_cost_basis"] if snapshot else 0
+
+    # ── Average cost basis ────────────────────────────────────────────────────
+    # "YOUR AVG COST" is the lay-person question "what did I pay per BTC on
+    # average?" — NOT a tax-style cost basis of the remaining position.
+    #
+    # We therefore compute a simple volume-weighted average across EVERY buy the
+    # user has ever made (the onboarding pseudo-trade for pre-existing BTC, plus
+    # all DCA/dip buys and recycler rebuys) and deliberately IGNORE sells.
+    #
+    # Why ignore sells: the USD Recycler intentionally cycles capital — it sells
+    # BTC and rebuys lower to bank "house money". A remaining-position basis like
+    #   (total_invested - total_received_from_sells) / current_btc
+    # collapses toward zero (or negative) once sells recoup the original outlay,
+    # and dividing by the small leftover stack produced the absurd ~$17B/BTC
+    # figure this field used to report. Averaging buys avoids that singularity
+    # entirely and matches the "N days @ $price" stack-header stat the dashboard
+    # already shows. The separate P&L stat covers realised gains.
+    all_buys      = [t for t in trades if t["side"] == "buy"]
+    buys_btc      = sum(t["btc_amount"] for t in all_buys)
+    buys_cost_usd = sum(t["usd_amount"] + t["fee_usd"] for t in all_buys)
+    if buys_btc > 0:
+        avg_basis = buys_cost_usd / buys_btc
+    else:
+        # No buys recorded yet — fall back to last snapshot (or 0 on a cold start).
+        avg_basis = snapshot["avg_cost_basis"] if snapshot else 0
 
     # Live Kraken balances (override snapshot)
     live = _get_live_balances()
