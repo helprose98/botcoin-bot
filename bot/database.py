@@ -6,6 +6,7 @@ mode switch log.
 
 import sqlite3
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -138,9 +139,11 @@ def init_db():
 # run on every startup. _ensure_column is the idempotent primitive; _run_migrations
 # is the ordered list of all schema upgrades since v1.4.0.
 
-def _ensure_column(conn, table: str, column: str, defn: str) -> None:
+def _ensure_column(conn, table: str, column: str, defn: str) -> bool:
     """
     Add a column to a table if it does not already exist.
+
+    Returns True if the column was just added, False if it already existed.
 
     Used in lieu of a full migration framework — safe and idempotent. The table
     and column names originate from this module's own source (never user input),
@@ -150,17 +153,79 @@ def _ensure_column(conn, table: str, column: str, defn: str) -> None:
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {defn}")
         logger.info("[migration] Added column %s.%s", table, column)
+        return True
+    return False
+
+
+def _run_named_migration(conn, name: str, sql: str) -> None:
+    """
+    Run a one-time SQL migration, tracked by name in _migrations_applied.
+
+    Unlike _ensure_column (which keys off schema shape), this keys off an
+    explicit bookkeeping row, so a one-shot data fix runs exactly once — even
+    on a database where the schema change it depends on was already applied by
+    an earlier release. The `sql` text is module-internal (never user input).
+    """
+    cur = conn.execute(
+        "SELECT 1 FROM _migrations_applied WHERE name = ?", (name,)
+    )
+    if cur.fetchone() is not None:
+        return
+    conn.execute(sql)
+    conn.execute(
+        "INSERT INTO _migrations_applied(name, applied_at) VALUES (?, ?)",
+        (name, int(time.time())),
+    )
+    conn.commit()
+    logger.info("[migration] Applied one-time migration %s", name)
 
 
 def _run_migrations(conn) -> None:
     """All schema upgrades since v1.4.0. Idempotent. Called from init_db."""
+    # Applied-migrations bookkeeping: lets one-time data fixes run exactly once,
+    # independently of whether their backing schema change already landed.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS _migrations_applied (
+            name        TEXT PRIMARY KEY,
+            applied_at  INTEGER NOT NULL
+        )
+    """)
+
     # v1.5.0 — maker-only fee read-back columns on trades.
+    #
+    # NOTE: historical (pre-v1.5.0) rows have was_maker IS NULL forever — the
+    # bot cannot retroactively determine whether old fills were maker or taker,
+    # so consumers (e.g. the dashboard) must treat NULL was_maker as "unknown",
+    # NOT as taker. Likewise fee_actual / price_actual stay NULL on those rows.
     _ensure_column(conn, "trades", "ordertype",    "TEXT DEFAULT 'limit-post'")
     _ensure_column(conn, "trades", "was_maker",    "INTEGER")
     _ensure_column(conn, "trades", "fee_currency", "TEXT DEFAULT 'USD'")
     _ensure_column(conn, "trades", "fee_actual",   "REAL")
     _ensure_column(conn, "trades", "price_actual", "REAL")
     _ensure_column(conn, "trades", "fill_status",  "TEXT DEFAULT 'pending'")
+
+    # v1.5.1 — one-time backfill. The v1.5.0 ALTER TABLE applied
+    # DEFAULT 'pending' to every pre-existing row, so historical (already
+    # filled) trades wrongly read as pending: the dashboard showed PENDING
+    # badges on year-old trades and the reconciler wasted QueryOrders calls on
+    # dead txids. Reclassify any trade >1h old still marked 'pending' as
+    # 'closed'. The 1h cutoff guards against false-positives on genuinely open
+    # orders at upgrade time (a real post-only order won't rest unfilled for an
+    # hour against a 1-tick limit). Runs once even on a DB already poisoned by
+    # v1.5.0, because it is keyed on _migrations_applied, not schema shape.
+    # NOTE: trades.timestamp is DATETIME text ("YYYY-MM-DD HH:MM:SS" via
+    # datetime('now')), not epoch seconds — so the cutoff must also be a
+    # datetime() value. Comparing against strftime('%s',...) would compare a
+    # date string to an epoch string and match nothing, silently no-op'ing the
+    # backfill.
+    _run_named_migration(conn, "backfill_v1_5_0_fill_status", """
+        UPDATE trades SET fill_status = 'closed'
+        WHERE fill_status = 'pending'
+          AND id IN (
+            SELECT id FROM trades
+            WHERE timestamp < datetime('now', '-1 hour')
+          )
+    """)
 
 
 # ── Trade functions ──────────────────────────────────────────────────────────
