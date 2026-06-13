@@ -165,37 +165,6 @@ def get_db(readonly=True):
     return conn
 
 
-def _record_quick_buy_trade(order_id: str, btc_amount: float, usd_amount: float,
-                             price_usd: float, fee_usd: float) -> bool:
-    """
-    Strictly controlled write — only inserts a quick_buy trade record.
-    This is the ONLY write operation botapi is allowed to perform.
-    No arbitrary SQL. No updates. No deletes.
-    """
-    try:
-        conn = get_db(readonly=False)
-        if not conn:
-            return False
-        net_usd = -(usd_amount + fee_usd)
-        conn.execute("""
-            INSERT INTO trades
-            (order_id, side, reason, btc_amount, usd_amount, price_usd, fee_usd, net_usd,
-             active_mode, paper_trade, ordertype, fill_status)
-            VALUES (?, 'buy', 'quick_buy', ?, ?, ?, ?, ?, 'btc_accumulate', 0,
-                    'limit-post', 'pending')
-        """, (order_id, round(btc_amount, 8), round(usd_amount, 2),
-               round(price_usd, 2), round(fee_usd, 4), round(net_usd, 4)))
-        conn.commit()
-        return True
-    except Exception as e:
-        import logging as _l
-        _l.getLogger("botapi").warning("Trade record failed: %s", e)
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-
 def _ensure_deposit_tables(conn):
     """
     Create the deposits + btc_price_history tables if they do not yet exist.
@@ -229,10 +198,9 @@ def _record_deposit(conn, kraken_refid, currency, amount, timestamp,
     """
     Controlled write — insert one deposit row, deduped on Kraken's ledger refid.
 
-    Like _record_quick_buy_trade this is a narrowly-scoped write: no arbitrary
-    SQL, INSERT-only, idempotent via ON CONFLICT DO NOTHING so re-syncing the
-    same Kraken ledger never duplicates rows. The caller owns the connection so
-    a whole sync batch commits together.
+    A narrowly-scoped write: no arbitrary SQL, INSERT-only, idempotent via
+    ON CONFLICT DO NOTHING so re-syncing the same Kraken ledger never duplicates
+    rows. The caller owns the connection so a whole sync batch commits together.
     """
     conn.execute("""
         INSERT INTO deposits
@@ -274,75 +242,6 @@ def _kraken_sign(urlpath, data, secret):
     message   = urlpath.encode() + hl.sha256(encoded).digest()
     mac       = hmac_mod.new(base64.b64decode(secret), message, hl.sha512)
     return base64.b64encode(mac.digest()).decode()
-
-
-# ── Maker-only order parameters (mirror of bot/kraken_client.py) ──────────────
-# The API container is isolated and does not import the bot package, so the
-# maker-only constants and pricing logic are replicated here in lockstep with
-# kraken_client.py. Any change to one must be applied to the other.
-KRAKEN_BTCUSD_TICK        = 0.1     # BTC/USD price tick (1 decimal)
-MAKER_PRICE_MAX_DRIFT     = 0.005   # 0.5% hard sanity bound vs last price
-MAX_MAKER_RETRIES         = 3       # post-only submit attempts before giving up
-MAKER_POLL_INTERVAL_SECS  = 2       # pause between a rejection and the reprice
-
-
-def _kraken_private(env, endpoint, params):
-    """Make an authenticated Kraken private POST. Raises on API error."""
-    api_key    = env.get("KRAKEN_API_KEY", "").strip()
-    api_secret = env.get("KRAKEN_API_SECRET", "").strip()
-    if not api_key or not api_secret:
-        raise RuntimeError("API keys not configured")
-    urlpath = f"/0/private/{endpoint}"
-    params  = dict(params)
-    params["nonce"] = str(int(time.time() * 1000))
-    post = urllib.parse.urlencode(params).encode()
-    sig  = _kraken_sign(urlpath, params, api_secret)
-    req  = urllib.request.Request(
-        "https://api.kraken.com" + urlpath,
-        data=post,
-        headers={
-            "API-Key":  api_key,
-            "API-Sign": sig,
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        result = json.loads(resp.read())
-    if result.get("error"):
-        raise RuntimeError(", ".join(result["error"]))
-    return result.get("result", {})
-
-
-def _kraken_book_top(pair):
-    """Return (best_bid, best_ask, last_price) from the public Ticker."""
-    req = urllib.request.Request(
-        f"https://api.kraken.com/0/public/Ticker?pair={pair}",
-        headers={"User-Agent": "BotCoin"},
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        ticker = json.loads(resp.read())
-    if ticker.get("error"):
-        raise RuntimeError("Could not fetch price from Kraken")
-    t = list(ticker["result"].values())[0]
-    return float(t["b"][0]), float(t["a"][0]), float(t["c"][0])
-
-
-def _maker_limit_price(side, best_bid, best_ask, last_price, retry_count=0):
-    """Post-only-safe limit price one+ ticks away from the near touch."""
-    offset = KRAKEN_BTCUSD_TICK * (1 + retry_count)
-    if side == "buy":
-        price = round(best_bid - offset, 1)
-    elif side == "sell":
-        price = round(best_ask + offset, 1)
-    else:
-        raise ValueError(f"Unknown side: {side}")
-    drift = abs(price - last_price) / last_price
-    if drift > MAKER_PRICE_MAX_DRIFT:
-        raise ValueError(
-            f"Maker price {price} drifts {drift:.2%} from last {last_price} "
-            f"(max {MAKER_PRICE_MAX_DRIFT:.1%})"
-        )
-    return price
 
 
 def _get_live_balances():
@@ -1082,7 +981,6 @@ def get_settings():
         "dca_day_of_month":  env.get("DCA_DAY_OF_MONTH", "1"),
         "dca_time_utc":      env.get("DCA_TIME_UTC", "13:00"),
         "mode":              env.get("MODE", "auto"),
-        "paper_trading":     env.get("PAPER_TRADING", "false"),
         "dip_tier1":         env.get("DIP_THRESHOLD_PERCENT", "0.07"),
         "dip_tier2":         env.get("DIP_TIER2_THRESHOLD_PERCENT", "0.15"),
         "dip_tier3":         env.get("DIP_TIER3_THRESHOLD_PERCENT", "0.22"),
@@ -1124,7 +1022,6 @@ def save_settings():
         "DCA_DAY_OF_MONTH":                body.get("dca_day_of_month"),
         "DCA_TIME_UTC":                    body.get("dca_time_utc"),
         "MODE":                            body.get("mode"),
-        "PAPER_TRADING":                   body.get("paper_trading"),
         "DIP_THRESHOLD_PERCENT":           body.get("dip_tier1"),
         "DIP_TIER2_THRESHOLD_PERCENT":     body.get("dip_tier2"),
         "DIP_TIER3_THRESHOLD_PERCENT":     body.get("dip_tier3"),
@@ -1147,88 +1044,6 @@ def save_settings():
     try:
         _write_env(updates)
         return jsonify({"ok": True, "message": "Settings saved. Bot picks up changes on next cycle (within 5 min)."})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ── Quick Buy (auth required) ────────────────────────────────────────────────
-
-@app.route("/api/buy", methods=["POST"])
-@requires_auth
-def quick_buy():
-    """
-    Execute an immediate maker-only (post-only) limit buy of BTC.
-    Body: { "usd_amount": 50.0 }
-
-    The order rests one+ ticks below best bid so it never crosses (oflags=post).
-    On a post-only rejection it reprices one tick further from the book, up to
-    MAX_MAKER_RETRIES. There is no taker fallback — a missed fill is acceptable.
-    """
-    body = request.get_json(force=True, silent=True) or {}
-    try:
-        usd_amount = float(body.get("usd_amount", 0))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "Invalid usd_amount"}), 400
-
-    env = _read_env()
-    max_order = float(env.get("MAX_ORDER_USD", "2000"))
-    if usd_amount < 5:
-        return jsonify({"ok": False, "error": "Minimum buy is $5"}), 400
-    if usd_amount > max_order:
-        return jsonify({"ok": False, "error": f"Amount exceeds max order size (${max_order})"}), 400
-
-    if not env.get("KRAKEN_API_KEY", "").strip() or not env.get("KRAKEN_API_SECRET", "").strip():
-        return jsonify({"ok": False, "error": "API keys not configured"}), 500
-
-    pair      = env.get("TRADING_PAIR", "XBTUSD")
-    maker_fee = float(env.get("KRAKEN_MAKER_FEE", "0.0025"))
-
-    try:
-        for attempt in range(MAX_MAKER_RETRIES):
-            best_bid, best_ask, last_price = _kraken_book_top(pair)
-            try:
-                limit_price = _maker_limit_price("buy", best_bid, best_ask,
-                                                 last_price, retry_count=attempt)
-            except ValueError as drift_err:
-                return jsonify({"ok": False, "error": str(drift_err)}), 400
-
-            # Discount the BTC volume by the maker fee so total spend ≈ usd_amount.
-            effective_usd = usd_amount / (1 + maker_fee)
-            btc_amount    = round(effective_usd / limit_price, 8)
-
-            try:
-                result = _kraken_private(env, "AddOrder", {
-                    "ordertype": "limit",
-                    "type":      "buy",
-                    "volume":    str(btc_amount),
-                    "pair":      pair,
-                    "price":     f"{limit_price:.1f}",
-                    "oflags":    "post",
-                    "userref":   99,  # integer tag for quick buy orders
-                })
-            except RuntimeError as order_err:
-                if "post only" in str(order_err).lower() and attempt < MAX_MAKER_RETRIES - 1:
-                    time.sleep(MAKER_POLL_INTERVAL_SECS)
-                    continue
-                return jsonify({"ok": False, "error": str(order_err)}), 400
-
-            order_ids = result.get("txid", [])
-            order_id  = order_ids[0] if order_ids else "unknown"
-            fee_usd   = round(usd_amount * maker_fee, 4)
-            _record_quick_buy_trade(order_id, btc_amount, usd_amount, limit_price, fee_usd)
-
-            return jsonify({
-                "ok":          True,
-                "order_id":    order_id,
-                "btc_amount":  btc_amount,
-                "usd_amount":  usd_amount,
-                "price":       limit_price,
-                "ordertype":   "limit-post",
-                "message":     f"Placed maker buy ~{btc_amount:.8f} BTC at ${limit_price:,.2f}"
-            })
-
-        return jsonify({"ok": False, "error": "Post-only order repeatedly crossed; not filled"}), 409
-
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -1307,7 +1122,6 @@ def setup_complete():
         "DCA_AMOUNT_USD":                  str(float(body["dca_amount"])),
         "DCA_DAY":                         body["dca_day"].strip().lower(),
         "DCA_TIME_UTC":                    body.get("dca_time_utc", "13:00").strip(),
-        "PAPER_TRADING":                   body.get("paper_trading", "false"),
         "RECYCLER_POOL_PERCENT":           "0.35",
         "DIP_THRESHOLD_PERCENT":           "0.07",
         "DIP_TIER2_THRESHOLD_PERCENT":     "0.15",

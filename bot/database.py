@@ -180,6 +180,85 @@ def _run_named_migration(conn, name: str, sql: str) -> None:
     logger.info("[migration] Applied one-time migration %s", name)
 
 
+def _migration_applied(conn, name: str) -> bool:
+    """Return True if the named one-time migration has already run."""
+    return conn.execute(
+        "SELECT 1 FROM _migrations_applied WHERE name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _mark_migration_applied(conn, name: str) -> None:
+    """Record that a procedural one-time migration has run."""
+    conn.execute(
+        "INSERT INTO _migrations_applied(name, applied_at) VALUES (?, ?)",
+        (name, int(time.time())),
+    )
+    conn.commit()
+    logger.info("[migration] Applied one-time migration %s", name)
+
+
+def _backfill_basis_from_ledger(conn) -> None:
+    """
+    Recompute avg_cost_basis on every portfolio snapshot from the confirmed-buy
+    ledger, in chronological (row-id) order.
+
+    Why: through v1.5.1, execute_buy computed basis from a live Kraken balance at
+    order-placement time. Resting maker orders weren't yet reflected in that
+    balance, so stacked maker buys used a too-low prev_btc denominator and the
+    persisted avg_cost_basis drifted. This rewrites each snapshot's basis using
+    the same volume-weighted-average-of-confirmed-buys definition the reconciler
+    now uses going forward, so historical rows match new ones.
+
+    Idempotent via _migrations_applied (keyed on name, not schema shape) so it
+    runs exactly once even on a DB already touched by an earlier release. Walks
+    buy snapshots oldest-first, accumulating the ledger as it goes; sell
+    snapshots carry the prevailing basis forward (sells don't change avg basis).
+    """
+    name = "recompute_basis_from_ledger"
+    if _migration_applied(conn, name):
+        return
+
+    # Snapshots joined to their trade, oldest first. trade_id may be NULL for
+    # the very first onboarding snapshot — those carry basis forward unchanged.
+    rows = conn.execute("""
+        SELECT s.id        AS snap_id,
+               s.trade_id  AS trade_id,
+               t.side      AS side,
+               t.btc_amount AS btc_amount,
+               t.usd_amount AS usd_amount,
+               t.fee_usd    AS fee_usd,
+               t.fill_status AS fill_status
+          FROM portfolio_snapshots s
+          LEFT JOIN trades t ON t.id = s.trade_id
+         ORDER BY s.timestamp ASC, s.id ASC
+    """).fetchall()
+
+    run_cost = 0.0   # cumulative USD spent on confirmed buys
+    run_btc  = 0.0   # cumulative BTC acquired from confirmed buys
+    last_basis = 0.0
+    final_basis = 0.0
+    for r in rows:
+        side = r["side"]
+        # Only confirmed buys move the basis. A sell, an unconfirmed/cancelled
+        # buy, or a trade-less snapshot just carries the prevailing basis.
+        if side == "buy" and r["fill_status"] == "closed":
+            run_cost += (r["usd_amount"] or 0.0) + (r["fee_usd"] or 0.0)
+            run_btc  += (r["btc_amount"] or 0.0)
+            last_basis = run_cost / run_btc if run_btc > 0 else 0.0
+        conn.execute(
+            "UPDATE portfolio_snapshots SET avg_cost_basis = ? WHERE id = ?",
+            (last_basis, r["snap_id"]),
+        )
+        final_basis = last_basis
+
+    _mark_migration_applied(conn, name)
+    logger.info(
+        "[migration] %s: rewrote %d snapshots | final avg_cost_basis $%.2f "
+        "(%.8f BTC across confirmed buys)",
+        name, len(rows), final_basis, run_btc,
+    )
+
+
 def _run_migrations(conn) -> None:
     """All schema upgrades since v1.4.0. Idempotent. Called from init_db."""
     # Applied-migrations bookkeeping: lets one-time data fixes run exactly once,
@@ -227,11 +306,18 @@ def _run_migrations(conn) -> None:
           )
     """)
 
+    # v1.5.2 — one-time basis backfill. Recomputes avg_cost_basis on every
+    # snapshot from the confirmed-buy ledger, correcting drift left by the old
+    # placement-time, live-balance basis math. Must run AFTER the v1.5.0/v1.5.1
+    # fill_status backfill above: it only counts buys whose fill_status is
+    # 'closed', and that migration is what marks historical fills closed.
+    _backfill_basis_from_ledger(conn)
+
 
 # ── Trade functions ──────────────────────────────────────────────────────────
 
 def record_trade(order_id, side, reason, btc_amount, usd_amount, price_usd,
-                 fee_usd, active_mode="btc_accumulate", paper_trade=False,
+                 fee_usd, active_mode="btc_accumulate",
                  ordertype="limit-post", was_maker=None, fee_currency="USD",
                  fee_actual=None, price_actual=None, fill_status="pending"):
     """
@@ -243,15 +329,17 @@ def record_trade(order_id, side, reason, btc_amount, usd_amount, price_usd,
     reconcile_pending_trades() once Kraken confirms the fill.
     """
     net_usd = usd_amount + fee_usd if side == "buy" else usd_amount - fee_usd
+    # paper_trade column retained for historical compatibility; no longer set as
+    # of v1.5.2 — every trade is real, so it always defaults to 0.
     with get_connection() as conn:
         cur = conn.execute("""
             INSERT INTO trades (order_id, side, reason, btc_amount, usd_amount,
-                                price_usd, fee_usd, net_usd, active_mode, paper_trade,
+                                price_usd, fee_usd, net_usd, active_mode,
                                 ordertype, was_maker, fee_currency, fee_actual,
                                 price_actual, fill_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (order_id, side, reason, btc_amount, usd_amount, price_usd,
-              fee_usd, net_usd, active_mode, 1 if paper_trade else 0,
+              fee_usd, net_usd, active_mode,
               ordertype, was_maker, fee_currency, fee_actual,
               price_actual, fill_status))
         trade_id = cur.lastrowid
@@ -287,9 +375,11 @@ def get_unreconciled_trades():
     """
     Return trades still awaiting a fill confirmation from Kraken.
 
-    These are real (non-paper) orders whose fill_status has not yet settled to
-    a terminal state — the reconciler queries each via QueryOrders and updates
-    the row once the order closes, cancels, or expires.
+    These are orders whose fill_status has not yet settled to a terminal state —
+    the reconciler queries each via QueryOrders and updates the row once the
+    order closes, cancels, or expires. The paper_trade = 0 filter excludes legacy
+    paper rows (which never had a real Kraken order to query); it is retained for
+    historical compatibility and is a no-op for all trades placed as of v1.5.2.
     """
     with get_connection() as conn:
         return conn.execute("""
@@ -302,12 +392,19 @@ def get_unreconciled_trades():
 
 
 def update_trade_fill(trade_id: int, fill_status: str, was_maker=None,
-                      fee_actual=None, price_actual=None):
+                      fee_actual=None, price_actual=None,
+                      btc_amount=None, usd_amount=None):
     """
     Update a trade row with reconciled fill data from Kraken.
 
     Only overwrites the reconciliation columns; the original estimate columns
     (fee_usd, price_usd) are left intact for audit/comparison.
+
+    btc_amount / usd_amount are optionally corrected here for partial fills:
+    when a maker order fills only part of its requested volume (vol_exec < vol)
+    and the remainder cancels, the recorded quantity must reflect what actually
+    filled — otherwise the ledger (and the basis computed from it) overstates the
+    position. Passed only by the reconciler when a partial is detected.
     """
     with get_connection() as conn:
         conn.execute("""
@@ -315,9 +412,83 @@ def update_trade_fill(trade_id: int, fill_status: str, was_maker=None,
                SET fill_status  = ?,
                    was_maker    = COALESCE(?, was_maker),
                    fee_actual   = COALESCE(?, fee_actual),
-                   price_actual = COALESCE(?, price_actual)
+                   price_actual = COALESCE(?, price_actual),
+                   btc_amount   = COALESCE(?, btc_amount),
+                   usd_amount   = COALESCE(?, usd_amount),
+                   net_usd      = CASE
+                                    WHEN ? IS NULL THEN net_usd
+                                    WHEN side = 'buy'  THEN ? + COALESCE(?, fee_usd)
+                                    ELSE ? - COALESCE(?, fee_usd)
+                                  END
              WHERE id = ?
-        """, (fill_status, was_maker, fee_actual, price_actual, trade_id))
+        """, (fill_status, was_maker, fee_actual, price_actual,
+              btc_amount, usd_amount,
+              usd_amount, usd_amount, fee_actual, usd_amount, fee_actual,
+              trade_id))
+
+
+# ── Cost-basis ledger (computed at fill-time, not placement-time) ─────────────
+# As of v1.5.2 the average cost basis is derived from the DB ledger of confirmed
+# fills, never from a live Kraken balance read. Maker orders rest on the book, so
+# at placement time a live balance does not yet include the resting order's BTC;
+# computing basis then (and never recomputing on fill) let avg_cost_basis drift,
+# especially when consecutive maker buys stacked. The ledger is the source of
+# truth: basis is recomputed from confirmed buys whenever a fill is settled.
+
+def get_avg_cost_basis_from_ledger(before_trade_id=None) -> tuple[float, float]:
+    """
+    Return (avg_cost_basis, total_btc_bought) from the confirmed-buy ledger.
+
+    Mirrors the dashboard's authoritative definition (volume-weighted average
+    across every confirmed buy, sells ignored — see botapi/api.py status()):
+        basis = sum(usd_amount + fee_usd) / sum(btc_amount)
+    over all closed buy rows. Only fills that Kraken has confirmed (fill_status
+    'closed') count — a still-resting order is not ours yet.
+
+    before_trade_id, when given, restricts the sum to buys with a lower row id,
+    i.e. the prior state of the ledger before that trade. Row id (not timestamp)
+    is used so the ordering is stable even for rows sharing a second-resolution
+    timestamp — the backfill and the reconciler must agree on "before".
+    """
+    sql = """
+        SELECT COALESCE(SUM(usd_amount + fee_usd), 0.0) AS cost,
+               COALESCE(SUM(btc_amount), 0.0)           AS btc
+          FROM trades
+         WHERE side = 'buy'
+           AND fill_status = 'closed'
+    """
+    params: tuple = ()
+    if before_trade_id is not None:
+        sql += " AND id < ?"
+        params = (before_trade_id,)
+    with get_connection() as conn:
+        row = conn.execute(sql, params).fetchone()
+    cost = row["cost"] or 0.0
+    btc  = row["btc"]  or 0.0
+    basis = cost / btc if btc > 0 else 0.0
+    return basis, btc
+
+
+def update_snapshot_basis(trade_id: int, avg_cost_basis: float) -> None:
+    """
+    Overwrite the avg_cost_basis on the portfolio snapshot tied to a trade.
+
+    The snapshot row is written at placement time carrying the prior basis
+    forward unchanged; once the fill is confirmed the reconciler recomputes the
+    basis from the ledger and writes it here. Updates the most recent snapshot
+    for the trade (there is one per placement).
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE portfolio_snapshots
+               SET avg_cost_basis = ?
+             WHERE id = (
+                 SELECT id FROM portfolio_snapshots
+                  WHERE trade_id = ?
+                  ORDER BY timestamp DESC, id DESC
+                  LIMIT 1
+             )
+        """, (avg_cost_basis, trade_id))
 
 
 # ── Portfolio snapshot functions ─────────────────────────────────────────────

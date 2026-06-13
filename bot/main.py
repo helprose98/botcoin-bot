@@ -110,6 +110,7 @@ from database import (
     record_mode_switch, get_last_trade_by_reason,
     add_range_position, close_range_position,
     get_unreconciled_trades, update_trade_fill, set_state,
+    get_avg_cost_basis_from_ledger, update_snapshot_basis,
 )
 from kraken_client import KrakenClient, KrakenAPIError
 from onboarding import run_onboarding
@@ -119,7 +120,7 @@ from strategies import (
     btc_check_dca, btc_check_dip_buy,
     btc_check_recycler_sell, btc_check_recycler_rebuy,
     # USD accumulate
-    usd_check_dca, usd_check_spike_sell,
+    usd_check_spike_sell,
     usd_check_recycler_buy, usd_check_recycler_resell,
     get_usd_avg_sell_basis,
 )
@@ -151,18 +152,25 @@ _last_active_mode: Mode | None = None
 
 def execute_buy(client: KrakenClient, current_price: float, usd_amount: float,
                 reason: str, active_mode: Mode, snapshot) -> bool:
-    """Place a limit buy order, record it, update the portfolio snapshot."""
+    """Place a maker limit buy order, record it as PENDING, snapshot the portfolio.
+
+    The order rests on the book and may not fill this tick, so we do NOT touch
+    the cost basis here. avg_cost_basis is recomputed from the DB ledger at
+    fill-confirmation time by reconcile_pending_trades — see that function and
+    database.get_avg_cost_basis_from_ledger. Computing basis at placement from a
+    live balance (the pre-v1.5.2 behaviour) was wrong: the resting order's BTC
+    isn't in the balance yet, so stacked maker buys drifted the basis.
+    """
     try:
         limit_price = round(current_price * 0.9995, 1)
         order = client.place_limit_buy(usd_amount, limit_price, reason)
         if not order:
             return False
 
-        prev_cost = snapshot["avg_cost_basis"] if snapshot else 0.0
-        prev_fees = snapshot["total_fees_paid"] if snapshot else 0.0
-        order_cost = order["usd_amount"] + order["fee_usd"]
+        prev_basis = snapshot["avg_cost_basis"] if snapshot else 0.0
+        prev_fees  = snapshot["total_fees_paid"] if snapshot else 0.0
 
-        # Fetch live balances to update snapshot accurately
+        # Fetch live balances to update the snapshot's balance fields accurately.
         try:
             balances = client.get_balance()
             live_btc = balances["BTC"]
@@ -172,12 +180,6 @@ def execute_buy(client: KrakenClient, current_price: float, usd_amount: float,
             live_btc = (snapshot["btc_balance"] if snapshot else 0.0) + order["btc_amount"]
             live_usd = max(0.0, (snapshot["usd_balance"] if snapshot else 0) - usd_amount)
 
-        # Cost basis uses live BTC balance (most accurate denominator)
-        prev_btc  = max(0.0, live_btc - order["btc_amount"])  # what we had before this buy
-        new_btc   = live_btc
-        new_basis = ((prev_btc * prev_cost) + order_cost) / new_btc if new_btc > 0 else order["price"]
-
-        is_paper = order.get("paper", cfg.paper_trading)
         trade_id = record_trade(
             order_id    = order["order_id"],
             side        = "buy",
@@ -187,23 +189,24 @@ def execute_buy(client: KrakenClient, current_price: float, usd_amount: float,
             price_usd   = order["price"],
             fee_usd     = order["fee_usd"],
             active_mode = active_mode.value,
-            paper_trade = is_paper,
             ordertype   = order.get("ordertype", "limit-post"),
-            # Paper orders fill synthetically; live maker orders rest until the
-            # reconciler confirms them via QueryOrders.
-            fill_status = "closed" if is_paper else "pending",
+            # Maker orders rest until the reconciler confirms them via QueryOrders.
+            fill_status = "pending",
         )
+        # basis carried forward unchanged at placement; recomputed from the
+        # ledger by reconcile_pending_trades once this fill is confirmed.
         save_portfolio_snapshot(
             trade_id        = trade_id,
             btc_balance     = live_btc,
             usd_balance     = live_usd,
-            avg_cost_basis  = new_basis,
+            avg_cost_basis  = prev_basis,
             total_fees_paid = prev_fees + order["fee_usd"],
         )
         throttle.record_trade_for_throttle()
-        logger.info("BUY ✓ | %.8f BTC @ $%.2f | mode=%s | reason=%s | new basis=$%.2f",
+        logger.info("BUY placed ⏳ | %.8f BTC @ $%.2f | mode=%s | reason=%s | "
+                    "basis recomputed on fill",
                     order["btc_amount"], order["price"],
-                    active_mode.value, reason, new_basis)
+                    active_mode.value, reason)
         return True
 
     except KrakenAPIError as e:
@@ -233,7 +236,6 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
             live_btc = max(0.0, (snapshot["btc_balance"] if snapshot else 0) - btc_amount)
             live_usd = (snapshot["usd_balance"] if snapshot else 0) + order["usd_amount"]
 
-        is_paper = order.get("paper", cfg.paper_trading)
         trade_id = record_trade(
             order_id    = order["order_id"],
             side        = "sell",
@@ -243,9 +245,9 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
             price_usd   = order["price"],
             fee_usd     = order["fee_usd"],
             active_mode = active_mode.value,
-            paper_trade = is_paper,
             ordertype   = order.get("ordertype", "limit-post"),
-            fill_status = "closed" if is_paper else "pending",
+            # Maker orders rest until the reconciler confirms them via QueryOrders.
+            fill_status = "pending",
         )
         save_portfolio_snapshot(
             trade_id        = trade_id,
@@ -255,7 +257,7 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
             total_fees_paid = prev_fees + order["fee_usd"],
         )
         throttle.record_trade_for_throttle()
-        logger.info("SELL ✓ | %.8f BTC @ $%.2f | mode=%s | reason=%s",
+        logger.info("SELL placed ⏳ | %.8f BTC @ $%.2f | mode=%s | reason=%s",
                     order["btc_amount"], order["price"], active_mode.value, reason)
         return True
 
@@ -427,10 +429,15 @@ def reconcile_pending_trades(client: KrakenClient):
     Read back fills for resting maker orders and settle their trade rows.
 
     Post-only orders rest on the book and may not fill on the tick they were
-    placed. Each unreconciled (pending/open, non-paper) trade row is looked up via
+    placed. Each unreconciled (pending/open) trade row is looked up via
     QueryOrders and its fill_status/fee_actual/price_actual/was_maker columns are
     updated once Kraken reports a terminal state:
       - closed              → record actual fee/price; was_maker from oflags.
+                              For buys, recompute avg_cost_basis from the DB
+                              ledger now that the fill is confirmed (the resting
+                              order's BTC has finally landed) and write it to the
+                              trade's snapshot. Partial fills (vol_exec < vol) are
+                              corrected down to what actually filled first.
       - open                → still resting; leave for a later tick (orphan-cancel
                               if it has been waiting longer than the orphan window).
       - canceled / expired  → settle as such; not counted as a real fill.
@@ -465,11 +472,47 @@ def reconcile_pending_trades(client: KrakenClient):
             was_maker = 1 if "post" in oflags else 0
             fee_actual = float(info.get("fee", 0) or 0)
             price_actual = float(info.get("price", 0) or 0) or None
+
+            # Partial-fill handling: Kraken reports vol_exec (executed volume)
+            # separately from vol (requested). A maker order can fill part of its
+            # size and have the remainder cancel/expire; the ledger must reflect
+            # only what actually filled or both the position and the basis derived
+            # from it are overstated. Correct btc_amount/usd_amount down to the
+            # executed volume when it falls short of the request.
+            fill_btc = None
+            fill_usd = None
+            try:
+                vol_exec = float(info.get("vol_exec", 0) or 0)
+                vol_req  = float(info.get("vol", 0) or 0)
+            except (TypeError, ValueError):
+                vol_exec = vol_req = 0.0
+            if vol_exec > 0 and vol_req > 0 and vol_exec < vol_req * 0.9999:
+                # Executed price for valuing the partial: actual fill price if
+                # Kraken gave one, else the recorded limit price.
+                exec_price = price_actual or row["price_usd"]
+                fill_btc = vol_exec
+                fill_usd = vol_exec * exec_price
+                logger.warning("[reconcile] %s partial fill: %.8f of %.8f BTC — "
+                               "correcting ledger quantity", order_id, vol_exec, vol_req)
+
             update_trade_fill(row["id"], "closed", was_maker=was_maker,
-                              fee_actual=fee_actual, price_actual=price_actual)
+                              fee_actual=fee_actual, price_actual=price_actual,
+                              btc_amount=fill_btc, usd_amount=fill_usd)
             logger.info("[reconcile] %s closed | maker=%d fee=$%.4f price=%s",
                         order_id, was_maker, fee_actual,
                         f"${price_actual:.2f}" if price_actual else "n/a")
+
+            # Recompute cost basis from the ledger now that this fill is confirmed.
+            # Buys move the basis; sells reduce BTC but leave the basis untouched
+            # (the dashboard's volume-weighted-buys definition — see
+            # get_avg_cost_basis_from_ledger). The ledger now includes this row
+            # (just marked 'closed'), so we ask for the basis as of all confirmed
+            # buys up to and including it: pass no before_trade_id.
+            if row["side"] == "buy":
+                new_basis, total_btc = get_avg_cost_basis_from_ledger()
+                update_snapshot_basis(row["id"], new_basis)
+                logger.info("[reconcile] basis recomputed from ledger: "
+                            "$%.2f over %.8f BTC", new_basis, total_btc)
 
         elif status == "open":
             update_trade_fill(row["id"], "open")
@@ -531,7 +574,6 @@ def main():
     logger.info("=" * 65)
     logger.info("Kraken BTC Accumulation Bot — Starting")
     logger.info("Configured mode : %s", cfg.mode.upper())
-    logger.info("Trading mode    : %s", "PAPER TRADING" if cfg.paper_trading else "LIVE TRADING")
     logger.info("=" * 65)
 
     init_db()
@@ -541,7 +583,6 @@ def main():
         api_secret    = cfg.api_secret,
         pair          = cfg.trading_pair,
         maker_fee     = cfg.maker_fee,
-        paper_trading = cfg.paper_trading,
     )
 
     run_onboarding(client)

@@ -276,34 +276,6 @@ def btc_check_recycler_rebuy(cfg: Config, current_price: float,
 #  USD ACCUMULATE MODE  (perfectly inverted)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def usd_check_dca(cfg: Config, current_price: float,
-                  btc_balance: float) -> dict | None:
-    """
-    USD mode: Sell a fixed USD-equivalent of BTC each week on schedule.
-    Mirror of btc_check_dca — sells BTC instead of buying it.
-    """
-    if not _in_dca_window(cfg):
-        return None
-    if not _is_dca_due("usd_dca_sell", cfg):
-        logger.debug("USD DCA: already executed this %s", cfg.dca_frequency)
-        return None
-
-    # DCA sell is a fixed commitment — does not compete with the recycler BTC pool.
-    # Use full BTC balance minus a small dust reserve.
-    target_btc  = cfg.dca_amount_usd / current_price
-    min_btc     = cfg.min_order_usd / current_price
-    max_btc     = cfg.max_order_usd / current_price
-    btc_to_sell = max(min_btc, min(target_btc, btc_balance, max_btc))
-
-    if btc_to_sell < min_btc or btc_balance <= 0:
-        logger.warning("USD DCA: insufficient BTC. Balance: %.8f BTC", btc_balance)
-        return None
-
-    logger.info("USD DCA triggered: sell %.8f BTC (~$%.2f)", btc_to_sell,
-                btc_to_sell * current_price)
-    return {"type": "sell", "btc_amount": btc_to_sell, "reason": "usd_dca_sell"}
-
-
 def usd_check_spike_sell(cfg: Config, current_price: float,
                           btc_balance: float,
                           vol_multiplier: float = 1.0) -> dict | None:

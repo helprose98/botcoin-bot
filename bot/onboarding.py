@@ -73,7 +73,11 @@ def run_onboarding(client: KrakenClient) -> dict:
                 usd_amount = usd_value,
                 price_usd  = avg_cost_basis,
                 fee_usd    = 0.0,  # fees already baked into historical cost basis
-                paper_trade= False,
+                # Pseudo-trade for pre-existing BTC: there is no resting Kraken
+                # order to reconcile, so mark it closed immediately. This also
+                # seeds the cost-basis ledger (get_avg_cost_basis_from_ledger
+                # counts only closed buys).
+                fill_status= "closed",
             )
             logger.info("Recorded existing %.8f BTC at $%.2f avg basis", btc_balance, avg_cost_basis)
         else:

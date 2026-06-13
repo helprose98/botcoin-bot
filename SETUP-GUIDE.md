@@ -83,9 +83,9 @@ The setup wizard walks you through:
 Default settings applied automatically:
 - DCA: $50/week every Thursday at 9:00 AM EDT
 - Mode: Auto (switches between BTC and USD accumulation based on market)
-- Paper Trading: ON (no real trades until you switch it off in Settings)
 
-All settings can be changed anytime from the dashboard.
+The bot trades real funds from the moment setup completes. All settings can be
+changed anytime from the dashboard.
 
 ---
 
@@ -96,16 +96,6 @@ Open **[https://dash.mybotcoin.io](https://dash.mybotcoin.io)** in your browser 
 - **Password**: the password you set in the wizard
 
 The dashboard connects live to your bot and shows real-time data.
-
----
-
-## Step 5 — Go Live
-
-When you're ready to start real trading:
-1. Open the dashboard → Settings tab
-2. Under "What are you stacking?" — turn off **Paper Trading Mode**
-3. Click **Save All Settings**
-4. Bot picks up the change within 5 minutes — no restart needed
 
 ---
 
@@ -124,7 +114,6 @@ When a new version is available, an orange **Update** badge appears in the dashb
 | DCA Day | Thursday | Dashboard → Settings |
 | DCA Time | 9:00 AM EDT | Dashboard → Settings |
 | Bot Mode | Auto | Dashboard → Settings |
-| Paper Trading | ON | Dashboard → Settings |
 | Aggression | Balanced | Dashboard → Settings |
 
 ---

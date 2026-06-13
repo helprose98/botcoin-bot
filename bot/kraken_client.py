@@ -77,14 +77,11 @@ def _is_post_only_rejection(err: "KrakenAPIError") -> bool:
 
 class KrakenClient:
     def __init__(self, api_key: str, api_secret: str, pair: str = "XBTUSD",
-                 maker_fee: float = 0.0025, paper_trading: bool = False):
+                 maker_fee: float = 0.0025):
         self.api_key = api_key
         self.api_secret = api_secret
         self.pair = PAIR_MAP.get(pair.upper(), pair.upper())
         self.maker_fee = maker_fee
-        self.paper_trading = paper_trading
-        if paper_trading:
-            logger.warning("⚠️  PAPER TRADING MODE — no real orders will be placed")
 
     # ── Authentication ────────────────────────────────────────────────────────
 
@@ -245,11 +242,10 @@ class KrakenClient:
         Place a post-only (maker-only) limit buy order.
 
         usd_amount: how much USD to spend (fee accounted for in the BTC volume).
-        price: the last-trade reference price from the caller. It is used as the
-            paper-trading fill price; for LIVE orders the actual limit is derived
-            from the live book so the order rests below best bid.
+        price: the last-trade reference price from the caller; the actual limit is
+            derived from the live book so the order rests below best bid.
 
-        All LIVE orders carry oflags=post and are retried up to MAX_MAKER_RETRIES
+        All orders carry oflags=post and are retried up to MAX_MAKER_RETRIES
         times, stepping one tick further from the book each time Kraken rejects
         with "Post only order would have crossed". There is NO taker fallback:
         maker-only is intentional — we accept a missed fill in exchange for the
@@ -258,22 +254,6 @@ class KrakenClient:
         Returns the standard order dict on success, or False on permanent failure
         (drift guard tripped, repeated post-only rejection, or API error).
         """
-        if self.paper_trading:
-            effective_usd = usd_amount / (1 + self.maker_fee)
-            btc_str = self._truncate_btc(effective_usd / price)
-            fee = usd_amount * self.maker_fee
-            logger.info("[PAPER] Placing limit BUY: %.8f BTC @ $%.1f (USD: $%.2f)",
-                        float(btc_str), price, usd_amount)
-            return {
-                "order_id":  f"PAPER-{int(time.time())}",
-                "btc_amount": float(btc_str),
-                "usd_amount": usd_amount,
-                "price":      price,
-                "fee_usd":    fee,
-                "ordertype":  "limit-post",
-                "paper":      True,
-            }
-
         for attempt in range(MAX_MAKER_RETRIES):
             best_bid, best_ask, last_price = self.get_book_top()
             try:
@@ -308,7 +288,6 @@ class KrakenClient:
                     "price":      limit_price,
                     "fee_usd":    fee,
                     "ordertype":  "limit-post",
-                    "paper":      False,
                 }
             except KrakenAPIError as e:
                 if _is_post_only_rejection(e) and attempt < MAX_MAKER_RETRIES - 1:
@@ -326,29 +305,14 @@ class KrakenClient:
         Place a post-only (maker-only) limit sell order.
 
         btc_amount: how much BTC to sell.
-        price: last-trade reference (paper fill price); LIVE limit is derived from
-            the live book so the order rests above best ask.
+        price: last-trade reference; the actual limit is derived from the live
+            book so the order rests above best ask.
 
         Identical maker-only semantics to place_limit_buy (oflags=post, up to
         MAX_MAKER_RETRIES reprices, no taker fallback). Returns the order dict on
         success or False on permanent failure.
         """
         btc_str = self._truncate_btc(btc_amount)
-
-        if self.paper_trading:
-            usd_gross = float(btc_str) * price
-            fee = usd_gross * self.maker_fee
-            logger.info("[PAPER] Placing limit SELL: %.8f BTC @ $%.1f (gross USD: $%.2f)",
-                        float(btc_str), price, usd_gross)
-            return {
-                "order_id":  f"PAPER-{int(time.time())}",
-                "btc_amount": float(btc_str),
-                "usd_amount": usd_gross,
-                "price":      price,
-                "fee_usd":    fee,
-                "ordertype":  "limit-post",
-                "paper":      True,
-            }
 
         for attempt in range(MAX_MAKER_RETRIES):
             best_bid, best_ask, last_price = self.get_book_top()
@@ -383,7 +347,6 @@ class KrakenClient:
                     "price":      limit_price,
                     "fee_usd":    fee,
                     "ordertype":  "limit-post",
-                    "paper":      False,
                 }
             except KrakenAPIError as e:
                 if _is_post_only_rejection(e) and attempt < MAX_MAKER_RETRIES - 1:

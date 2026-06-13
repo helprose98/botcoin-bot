@@ -87,9 +87,6 @@ class Config:
     range_trade_size_usd:   float
     range_max_positions:    int
 
-    # Mode
-    paper_trading: bool
-
     # Volatility-adaptive thresholds (Tier 1)
     volatility_adaptive_enabled: bool
     vol_multiplier_min:          float
@@ -133,7 +130,6 @@ _ENV_DEFAULTS = {
     "SIDEWAYS_ENABLED":               "true",
     "RANGE_TRADE_SIZE_USD":           "500",
     "RANGE_MAX_POSITIONS":            "5",
-    "PAPER_TRADING":                  "true",
     "VOLATILITY_ADAPTIVE_ENABLED":    "true",
     "VOL_MULTIPLIER_MIN":             "0.7",
     "VOL_MULTIPLIER_MAX":             "1.5",
@@ -220,8 +216,6 @@ def load_config() -> Config:
         range_trade_size_usd = _float("RANGE_TRADE_SIZE_USD", 500.0),
         range_max_positions  = _int("RANGE_MAX_POSITIONS", 5),
 
-        paper_trading = _bool("PAPER_TRADING", True),
-
         volatility_adaptive_enabled = _bool("VOLATILITY_ADAPTIVE_ENABLED", True),
         vol_multiplier_min          = _float("VOL_MULTIPLIER_MIN", 0.7),
         vol_multiplier_max          = _float("VOL_MULTIPLIER_MAX", 1.5),
@@ -252,7 +246,6 @@ def load_config() -> Config:
     if cfg.max_trades_per_day < 1:
         raise ValueError("MAX_TRADES_PER_DAY must be >= 1")
 
-    mode = "PAPER TRADING" if cfg.paper_trading else "LIVE TRADING"
-    logger.info("Config loaded — Mode: %s | DCA: $%.2f/%s @ %s UTC",
-                mode, cfg.dca_amount_usd, cfg.dca_frequency, cfg.dca_time_utc)
+    logger.info("Config loaded — DCA: $%.2f/%s @ %s UTC",
+                cfg.dca_amount_usd, cfg.dca_frequency, cfg.dca_time_utc)
     return cfg
