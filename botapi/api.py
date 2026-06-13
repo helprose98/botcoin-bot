@@ -194,6 +194,54 @@ def _record_quick_buy_trade(order_id: str, btc_amount: float, usd_amount: float,
             conn.close()
 
 
+def _ensure_deposit_tables(conn):
+    """
+    Create the deposits + btc_price_history tables if they do not yet exist.
+
+    These are normally created by the bot container's database.init_db(), but
+    the API container shares the same DB file and may serve /api/deposits before
+    the bot has booted on a fresh install. The DDL is kept byte-for-byte in sync
+    with bot/database.py so both writers agree on the schema.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS deposits (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            kraken_refid      TEXT UNIQUE NOT NULL,
+            currency          TEXT NOT NULL,
+            amount            REAL NOT NULL,
+            timestamp         TEXT NOT NULL,
+            price_usd_at_time REAL,
+            usd_value_at_time REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS btc_price_history (
+            date            TEXT PRIMARY KEY,
+            price_usd       REAL NOT NULL,
+            cached_at       DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_deposits_timestamp ON deposits(timestamp);
+    """)
+
+
+def _record_deposit(conn, kraken_refid, currency, amount, timestamp,
+                    price_usd_at_time, usd_value_at_time):
+    """
+    Controlled write — insert one deposit row, deduped on Kraken's ledger refid.
+
+    Like _record_quick_buy_trade this is a narrowly-scoped write: no arbitrary
+    SQL, INSERT-only, idempotent via ON CONFLICT DO NOTHING so re-syncing the
+    same Kraken ledger never duplicates rows. The caller owns the connection so
+    a whole sync batch commits together.
+    """
+    conn.execute("""
+        INSERT INTO deposits
+            (kraken_refid, currency, amount, timestamp,
+             price_usd_at_time, usd_value_at_time)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(kraken_refid) DO NOTHING
+    """, (kraken_refid, currency, round(amount, 8), timestamp,
+          price_usd_at_time, round(usd_value_at_time, 2)))
+
+
 def query(sql, params=()):
     conn = get_db()
     if not conn:
@@ -284,11 +332,161 @@ def _get_live_price() -> float | None:
         return None
 
 
+def _coingecko_price_at(date_key: str):
+    """
+    Return BTC/USD price for a UTC day (YYYY-MM-DD), cached in btc_price_history.
+
+    Cache-first: a hit avoids any network call. On a miss we ask CoinGecko's free
+    /coins/bitcoin/history endpoint (no auth; expects DD-MM-YYYY) and persist the
+    result. A day's price is immutable once past, so the cache is authoritative
+    after the first lookup. Returns a float or None on any failure / missing data.
+    This mirrors bot/price_history.get_btc_price_at(), kept here because the API
+    container is deliberately isolated and does not import the bot package.
+    """
+    cached = query_one("SELECT price_usd FROM btc_price_history WHERE date=?", (date_key,))
+    if cached:
+        return cached["price_usd"]
+
+    y, m, d = date_key.split("-")
+    params = urllib.parse.urlencode({"date": f"{d}-{m}-{y}", "localization": "false"})
+    try:
+        req = urllib.request.Request(
+            f"https://api.coingecko.com/api/v3/coins/bitcoin/history?{params}",
+            headers={"User-Agent": "BotCoin/2.0", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+        price = body.get("market_data", {}).get("current_price", {}).get("usd")
+    except Exception:
+        return None
+    if price is None:
+        return None
+
+    price = float(price)
+    conn = get_db(readonly=False)
+    if conn:
+        try:
+            _ensure_deposit_tables(conn)
+            conn.execute("""
+                INSERT INTO btc_price_history (date, price_usd) VALUES (?, ?)
+                ON CONFLICT(date) DO UPDATE SET price_usd=excluded.price_usd
+            """, (date_key, price))
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    return price
+
+
+def _fetch_kraken_deposits():
+    """
+    Pull deposit-type ledger entries (XBT + ZUSD) from Kraken's private Ledgers
+    API. Returns a list of normalised dicts {refid, currency, amount, timestamp}
+    sorted oldest-first, or [] when keys are missing or the call fails.
+    """
+    env        = _read_env()
+    api_key    = env.get("KRAKEN_API_KEY", "").strip()
+    api_secret = env.get("KRAKEN_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        return []
+
+    urlpath = "/0/private/Ledgers"
+    nonce   = str(int(time.time() * 1000))
+    data    = {"nonce": nonce, "type": "deposit"}
+    post    = urllib.parse.urlencode(data).encode()
+    sig     = _kraken_sign(urlpath, data, api_secret)
+    try:
+        req = urllib.request.Request(
+            "https://api.kraken.com" + urlpath,
+            data=post,
+            headers={
+                "API-Key":  api_key,
+                "API-Sign": sig,
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+    except Exception:
+        return []
+
+    if body.get("error"):
+        return []
+
+    ledger = body.get("result", {}).get("ledger", {})
+    deposits = []
+    for refid, entry in ledger.items():
+        if entry.get("type") != "deposit":
+            continue
+        asset = entry.get("asset", "")
+        if asset in ("XXBT", "XBT"):
+            currency = "BTC"
+        elif asset in ("ZUSD", "USD"):
+            currency = "USD"
+        else:
+            continue  # ignore non BTC/USD deposits
+        try:
+            amount = abs(float(entry.get("amount", 0)))
+            ts     = float(entry.get("time", 0))
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        # Kraken keys the ledger dict by refid; entry may also carry "refid"
+        # pointing at the funding ref. The dict key is unique per ledger row.
+        deposits.append({
+            "refid":     refid,
+            "currency":  currency,
+            "amount":    amount,
+            "timestamp": iso,
+        })
+    deposits.sort(key=lambda d: d["timestamp"])
+    return deposits
+
+
 def _get_200ma():
     rows = query("SELECT price_usd FROM daily_prices ORDER BY date DESC LIMIT 200")
     if len(rows) < 10:
         return None
     return sum(r["price_usd"] for r in rows) / len(rows)
+
+
+def _trend_duration(ma200):
+    """
+    Compute how long price has held its current side of the 200-day MA.
+
+    Walks the daily closing prices newest→oldest and counts consecutive days
+    that sit on the same side of `ma200` as the most recent day, stopping at the
+    first crossover. The returned count is the trend's age in days; if no
+    crossover exists in the stored history, the full history length is returned
+    (the trend is at least that old). `side` is "above" or "below" relative to
+    the 200MA.
+
+    Edge cases, by construction of the loop:
+      * Today is itself a crossover day → only today matches → duration 1.
+      * No crossover anywhere in history → every day matches → duration == len.
+      * A single stored day → duration 1.
+
+    Returns None when there is no daily price data or no computable 200MA, so
+    the caller can omit `bot.trend` and let older/empty bots degrade gracefully.
+    """
+    if not ma200:
+        return None
+    rows = query("SELECT price_usd FROM daily_prices ORDER BY date DESC")
+    if not rows:
+        return None
+
+    today_side = "above" if rows[0]["price_usd"] >= ma200 else "below"
+    duration = 0
+    for r in rows:
+        side = "above" if r["price_usd"] >= ma200 else "below"
+        if side != today_side:
+            break
+        duration += 1
+
+    return {"duration_days": duration, "side": today_side}
 
 
 def _next_dca_timestamp():
@@ -580,6 +778,7 @@ def status():
             "waiting_resell":  waiting_resell,
             "last_switch":     last_switch_ts,
             "recent_high":     round(recent_high, 2) if recent_high else None,
+            "trend":           _trend_duration(ma200),
             "sideways":        _get_sideways_status(),
         },
         "mood":       mood,
@@ -597,6 +796,77 @@ def status():
 def trades():
     rows = query("SELECT * FROM trades WHERE reason != 'onboarding' ORDER BY timestamp DESC LIMIT 500")
     return jsonify([_format_trade(t) for t in rows])
+
+
+@app.route("/api/deposits")
+@requires_auth
+def deposits():
+    """
+    Return historical deposits with at-time USD valuation.
+
+    On each hit we lazily sync new Kraken deposit-ledger entries into the local
+    `deposits` table (idempotent via kraken_refid), looking up the BTC/USD price
+    on each BTC deposit's day from CoinGecko (cached, with a courtesy sleep
+    between uncached lookups to respect the free-tier rate limit). USD deposits
+    are valued at face. We then return every stored deposit plus rolled-up
+    totals. No background polling — sync happens here, lazily.
+    """
+    new_deposits = _fetch_kraken_deposits()
+
+    if new_deposits:
+        # Which refids do we already have? Avoid re-pricing known deposits.
+        existing = {r["kraken_refid"] for r in
+                    query("SELECT kraken_refid FROM deposits")}
+        conn = get_db(readonly=False)
+        if conn:
+            try:
+                _ensure_deposit_tables(conn)
+                uncached_lookups = 0
+                for dep in new_deposits:
+                    if dep["refid"] in existing:
+                        continue
+                    if dep["currency"] == "BTC":
+                        date_key = dep["timestamp"][:10]
+                        had_cache = query_one(
+                            "SELECT 1 FROM btc_price_history WHERE date=?", (date_key,)
+                        )
+                        # Pace only genuine CoinGecko calls (free tier ~30/min).
+                        if not had_cache and uncached_lookups > 0:
+                            time.sleep(2)
+                        price = _coingecko_price_at(date_key)
+                        if not had_cache:
+                            uncached_lookups += 1
+                        usd_value = (dep["amount"] * price) if price else 0.0
+                        _record_deposit(conn, dep["refid"], "BTC", dep["amount"],
+                                        dep["timestamp"], price, usd_value)
+                    else:  # USD
+                        _record_deposit(conn, dep["refid"], "USD", dep["amount"],
+                                        dep["timestamp"], None, dep["amount"])
+                conn.commit()
+            except Exception as e:
+                import logging as _l
+                _l.getLogger("botapi").warning("Deposit sync failed: %s", e)
+            finally:
+                conn.close()
+
+    rows = query("SELECT * FROM deposits ORDER BY timestamp ASC")
+    out = [{
+        "currency":          r["currency"],
+        "amount":            round(r["amount"], 8),
+        "timestamp":         r["timestamp"],
+        "price_usd_at_time": round(r["price_usd_at_time"], 2) if r["price_usd_at_time"] is not None else None,
+        "usd_value_at_time": round(r["usd_value_at_time"], 2),
+    } for r in rows]
+
+    btc_rows = [r for r in out if r["currency"] == "BTC"]
+    usd_rows = [r for r in out if r["currency"] == "USD"]
+    totals = {
+        "btc_deposits_count":            len(btc_rows),
+        "btc_deposits_amount":           round(sum(r["amount"] for r in btc_rows), 8),
+        "btc_deposits_usd_value_at_time": round(sum(r["usd_value_at_time"] for r in btc_rows), 2),
+        "usd_deposits_amount":           round(sum(r["amount"] for r in usd_rows), 2),
+    }
+    return jsonify({"deposits": out, "totals": totals})
 
 
 @app.route("/api/open_orders")

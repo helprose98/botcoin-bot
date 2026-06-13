@@ -100,6 +100,24 @@ def init_db():
                 status          TEXT NOT NULL DEFAULT 'open'  -- 'open', 'closed', 'converted'
             );
 
+            -- Historical deposits/transfers into Kraken, valued at deposit time
+            CREATE TABLE IF NOT EXISTS deposits (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                kraken_refid      TEXT UNIQUE NOT NULL,   -- Kraken ledger ref id, used to dedupe
+                currency          TEXT NOT NULL,          -- 'BTC' or 'USD'
+                amount            REAL NOT NULL,          -- positive amount in native currency
+                timestamp         TEXT NOT NULL,          -- ISO 8601 UTC
+                price_usd_at_time REAL,                   -- BTC: looked up; USD: NULL
+                usd_value_at_time REAL NOT NULL           -- BTC: amount * price; USD: amount
+            );
+
+            -- Cached daily BTC/USD prices from CoinGecko (deposit valuation)
+            CREATE TABLE IF NOT EXISTS btc_price_history (
+                date            TEXT PRIMARY KEY,          -- YYYY-MM-DD (UTC)
+                price_usd       REAL NOT NULL,
+                cached_at       DATETIME NOT NULL DEFAULT (datetime('now'))
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_price_history_ts  ON price_history(timestamp);
             CREATE INDEX IF NOT EXISTS idx_daily_prices_date ON daily_prices(date);
@@ -107,6 +125,7 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_trades_reason     ON trades(reason);
             CREATE INDEX IF NOT EXISTS idx_trades_mode       ON trades(active_mode);
             CREATE INDEX IF NOT EXISTS idx_range_positions_status ON range_positions(status);
+            CREATE INDEX IF NOT EXISTS idx_deposits_timestamp ON deposits(timestamp);
         """)
     logger.info("Database initialized at %s", DB_PATH)
 
@@ -321,6 +340,38 @@ def count_open_range_positions() -> int:
             "SELECT COUNT(*) as c FROM range_positions WHERE status='open'"
         ).fetchone()
     return row["c"] if row else 0
+
+
+# ── Deposits ──────────────────────────────────────────────────────────────────
+
+def upsert_deposit(kraken_refid: str, currency: str, amount: float,
+                   timestamp: str, price_usd_at_time, usd_value_at_time: float):
+    """
+    Insert a deposit row, deduping on Kraken's ledger ref id.
+
+    Idempotent by design: syncing the same Kraken ledger repeatedly is a no-op
+    for already-seen refids, so the endpoint can safely re-sync on every hit.
+    `price_usd_at_time` is None for USD deposits (their USD value is the amount
+    itself); for BTC deposits it is the CoinGecko price on the deposit day.
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO deposits
+                (kraken_refid, currency, amount, timestamp,
+                 price_usd_at_time, usd_value_at_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(kraken_refid) DO NOTHING
+        """, (kraken_refid, currency, amount, timestamp,
+              price_usd_at_time, usd_value_at_time))
+
+
+def get_all_deposits() -> list[dict]:
+    """Return every recorded deposit, oldest first."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM deposits ORDER BY timestamp ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Reporting ────────────────────────────────────────────────────────────────
