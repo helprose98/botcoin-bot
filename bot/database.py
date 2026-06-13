@@ -127,22 +127,68 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_range_positions_status ON range_positions(status);
             CREATE INDEX IF NOT EXISTS idx_deposits_timestamp ON deposits(timestamp);
         """)
+        _run_migrations(conn)
     logger.info("Database initialized at %s", DB_PATH)
+
+
+# ── Schema migrations ─────────────────────────────────────────────────────────
+# There is no migration framework: init_db only runs CREATE TABLE IF NOT EXISTS,
+# so existing user databases are never recreated. New columns added in later
+# versions must be applied with guarded ALTER TABLE statements that are safe to
+# run on every startup. _ensure_column is the idempotent primitive; _run_migrations
+# is the ordered list of all schema upgrades since v1.4.0.
+
+def _ensure_column(conn, table: str, column: str, defn: str) -> None:
+    """
+    Add a column to a table if it does not already exist.
+
+    Used in lieu of a full migration framework — safe and idempotent. The table
+    and column names originate from this module's own source (never user input),
+    so the f-string interpolation carries no injection risk.
+    """
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {defn}")
+        logger.info("[migration] Added column %s.%s", table, column)
+
+
+def _run_migrations(conn) -> None:
+    """All schema upgrades since v1.4.0. Idempotent. Called from init_db."""
+    # v1.5.0 — maker-only fee read-back columns on trades.
+    _ensure_column(conn, "trades", "ordertype",    "TEXT DEFAULT 'limit-post'")
+    _ensure_column(conn, "trades", "was_maker",    "INTEGER")
+    _ensure_column(conn, "trades", "fee_currency", "TEXT DEFAULT 'USD'")
+    _ensure_column(conn, "trades", "fee_actual",   "REAL")
+    _ensure_column(conn, "trades", "price_actual", "REAL")
+    _ensure_column(conn, "trades", "fill_status",  "TEXT DEFAULT 'pending'")
 
 
 # ── Trade functions ──────────────────────────────────────────────────────────
 
 def record_trade(order_id, side, reason, btc_amount, usd_amount, price_usd,
-                 fee_usd, active_mode="btc_accumulate", paper_trade=False):
-    """Insert a completed trade and return its row id."""
+                 fee_usd, active_mode="btc_accumulate", paper_trade=False,
+                 ordertype="limit-post", was_maker=None, fee_currency="USD",
+                 fee_actual=None, price_actual=None, fill_status="pending"):
+    """
+    Insert a completed trade and return its row id.
+
+    The maker-only fields (ordertype, was_maker, fee_currency, fee_actual,
+    price_actual, fill_status) are optional with safe defaults so existing
+    callers keep working. They are populated/overwritten by
+    reconcile_pending_trades() once Kraken confirms the fill.
+    """
     net_usd = usd_amount + fee_usd if side == "buy" else usd_amount - fee_usd
     with get_connection() as conn:
         cur = conn.execute("""
             INSERT INTO trades (order_id, side, reason, btc_amount, usd_amount,
-                                price_usd, fee_usd, net_usd, active_mode, paper_trade)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                price_usd, fee_usd, net_usd, active_mode, paper_trade,
+                                ordertype, was_maker, fee_currency, fee_actual,
+                                price_actual, fill_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (order_id, side, reason, btc_amount, usd_amount, price_usd,
-              fee_usd, net_usd, active_mode, 1 if paper_trade else 0))
+              fee_usd, net_usd, active_mode, 1 if paper_trade else 0,
+              ordertype, was_maker, fee_currency, fee_actual,
+              price_actual, fill_status))
         trade_id = cur.lastrowid
     logger.info("[TRADE] %s %s BTC @ $%.2f | reason=%s | mode=%s | fee=$%.4f",
                 side.upper(), btc_amount, price_usd, reason, active_mode, fee_usd)
@@ -170,6 +216,43 @@ def get_trades_by_mode(mode: str):
             "SELECT * FROM trades WHERE active_mode=? ORDER BY timestamp ASC",
             (mode,)
         ).fetchall()
+
+
+def get_unreconciled_trades():
+    """
+    Return trades still awaiting a fill confirmation from Kraken.
+
+    These are real (non-paper) orders whose fill_status has not yet settled to
+    a terminal state — the reconciler queries each via QueryOrders and updates
+    the row once the order closes, cancels, or expires.
+    """
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT * FROM trades
+            WHERE fill_status IN ('pending', 'open')
+              AND paper_trade = 0
+              AND order_id IS NOT NULL
+            ORDER BY timestamp ASC
+        """).fetchall()
+
+
+def update_trade_fill(trade_id: int, fill_status: str, was_maker=None,
+                      fee_actual=None, price_actual=None):
+    """
+    Update a trade row with reconciled fill data from Kraken.
+
+    Only overwrites the reconciliation columns; the original estimate columns
+    (fee_usd, price_usd) are left intact for audit/comparison.
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE trades
+               SET fill_status  = ?,
+                   was_maker    = COALESCE(?, was_maker),
+                   fee_actual   = COALESCE(?, fee_actual),
+                   price_actual = COALESCE(?, price_actual)
+             WHERE id = ?
+        """, (fill_status, was_maker, fee_actual, price_actual, trade_id))
 
 
 # ── Portfolio snapshot functions ─────────────────────────────────────────────

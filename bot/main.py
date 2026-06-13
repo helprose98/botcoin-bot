@@ -109,6 +109,7 @@ from database import (
     get_latest_snapshot, record_price, record_daily_price, get_summary,
     record_mode_switch, get_last_trade_by_reason,
     add_range_position, close_range_position,
+    get_unreconciled_trades, update_trade_fill, set_state,
 )
 from kraken_client import KrakenClient, KrakenAPIError
 from onboarding import run_onboarding
@@ -123,11 +124,22 @@ from strategies import (
     get_usd_avg_sell_basis,
 )
 from sideways import check_sideways
+from volatility import calculate_atr
+import throttle
 
 LOOP_INTERVAL_SECONDS  = 300   # Check every 5 minutes
 PRICE_SAMPLE_INTERVAL  = 900   # Record intraday price every 15 min
 DAILY_SAMPLE_HOUR_UTC  = 0     # Record daily price at midnight UTC (for 200MA)
 STATUS_PRINT_INTERVAL  = 3600  # Print status summary every hour
+
+# Maker-only orders rest on the book and may not fill in the same tick. A
+# pending/open order older than this is treated as orphaned: it is canceled so
+# stale resting orders don't tie up capital indefinitely.
+PENDING_ORDER_ORPHAN_SECONDS = 24 * 3600
+
+# Taker fee baseline used only for reconciler logging context; the real fee is
+# read back from Kraken. Kept here as a named constant (no magic numbers).
+TAKER_FEE_BASELINE = 0.0026
 
 _last_intraday_sample = 0.0
 _last_daily_sample_date = ""
@@ -165,6 +177,7 @@ def execute_buy(client: KrakenClient, current_price: float, usd_amount: float,
         new_btc   = live_btc
         new_basis = ((prev_btc * prev_cost) + order_cost) / new_btc if new_btc > 0 else order["price"]
 
+        is_paper = order.get("paper", cfg.paper_trading)
         trade_id = record_trade(
             order_id    = order["order_id"],
             side        = "buy",
@@ -174,7 +187,11 @@ def execute_buy(client: KrakenClient, current_price: float, usd_amount: float,
             price_usd   = order["price"],
             fee_usd     = order["fee_usd"],
             active_mode = active_mode.value,
-            paper_trade = order.get("paper", cfg.paper_trading),
+            paper_trade = is_paper,
+            ordertype   = order.get("ordertype", "limit-post"),
+            # Paper orders fill synthetically; live maker orders rest until the
+            # reconciler confirms them via QueryOrders.
+            fill_status = "closed" if is_paper else "pending",
         )
         save_portfolio_snapshot(
             trade_id        = trade_id,
@@ -183,6 +200,7 @@ def execute_buy(client: KrakenClient, current_price: float, usd_amount: float,
             avg_cost_basis  = new_basis,
             total_fees_paid = prev_fees + order["fee_usd"],
         )
+        throttle.record_trade_for_throttle()
         logger.info("BUY ✓ | %.8f BTC @ $%.2f | mode=%s | reason=%s | new basis=$%.2f",
                     order["btc_amount"], order["price"],
                     active_mode.value, reason, new_basis)
@@ -215,6 +233,7 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
             live_btc = max(0.0, (snapshot["btc_balance"] if snapshot else 0) - btc_amount)
             live_usd = (snapshot["usd_balance"] if snapshot else 0) + order["usd_amount"]
 
+        is_paper = order.get("paper", cfg.paper_trading)
         trade_id = record_trade(
             order_id    = order["order_id"],
             side        = "sell",
@@ -224,7 +243,9 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
             price_usd   = order["price"],
             fee_usd     = order["fee_usd"],
             active_mode = active_mode.value,
-            paper_trade = order.get("paper", cfg.paper_trading),
+            paper_trade = is_paper,
+            ordertype   = order.get("ordertype", "limit-post"),
+            fill_status = "closed" if is_paper else "pending",
         )
         save_portfolio_snapshot(
             trade_id        = trade_id,
@@ -233,6 +254,7 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
             avg_cost_basis  = snapshot["avg_cost_basis"] if snapshot else 0,
             total_fees_paid = prev_fees + order["fee_usd"],
         )
+        throttle.record_trade_for_throttle()
         logger.info("SELL ✓ | %.8f BTC @ $%.2f | mode=%s | reason=%s",
                     order["btc_amount"], order["price"], active_mode.value, reason)
         return True
@@ -248,10 +270,19 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
 # ── Range Recycler execution ──────────────────────────────────────────────────
 
 def run_range_recycler(client, current_price, snapshot, active_mode):
-    """Execute Range Recycler actions from the sideways overlay."""
+    """Execute Range Recycler actions from the sideways overlay.
+
+    Sideways trades are subject to the global throttle: they can otherwise stack
+    on top of a BTC/USD strategy trade in the same tick, which is exactly the
+    cross-strategy thrash the dampener exists to prevent.
+    """
     actions = check_sideways(cfg, current_price, active_mode)
 
     for action in actions:
+        allowed, msg = throttle.check_throttle(action["reason"], cfg)
+        if not allowed:
+            logger.info("[throttle] skipping %s: %s", action["reason"], msg)
+            continue
         if action["type"] == "buy":
             ok = execute_buy(client, current_price, action["usd_amount"],
                              action["reason"], active_mode, snapshot)
@@ -291,7 +322,28 @@ def run_range_recycler(client, current_price, snapshot, active_mode):
 
 # ── Strategy dispatch ─────────────────────────────────────────────────────────
 
-def run_btc_accumulate_strategies(client, current_price, snapshot, active_mode):
+def _dispatch_buy(client, current_price, action, active_mode, snapshot):
+    """Apply the global throttle, then place a buy. Returns True if a trade fired."""
+    allowed, msg = throttle.check_throttle(action["reason"], cfg)
+    if not allowed:
+        logger.info("[throttle] skipping %s: %s", action["reason"], msg)
+        return False
+    return execute_buy(client, current_price, action["usd_amount"],
+                       action["reason"], active_mode, snapshot)
+
+
+def _dispatch_sell(client, current_price, action, active_mode, snapshot):
+    """Apply the global throttle, then place a sell. Returns True if a trade fired."""
+    allowed, msg = throttle.check_throttle(action["reason"], cfg)
+    if not allowed:
+        logger.info("[throttle] skipping %s: %s", action["reason"], msg)
+        return False
+    return execute_sell(client, current_price, action["btc_amount"],
+                        action["reason"], active_mode, snapshot)
+
+
+def run_btc_accumulate_strategies(client, current_price, snapshot, active_mode,
+                                  vol_multiplier=1.0):
     """Run all BTC accumulation strategy checks in priority order."""
     # Always fetch live balances from Kraken — never trust stale snapshot values.
     # The snapshot can lag after failed orders (e.g. EOrder:Insufficient funds)
@@ -310,31 +362,28 @@ def run_btc_accumulate_strategies(client, current_price, snapshot, active_mode):
     # Priority 1: Recycler rebuy (cash is sitting waiting, deploy it)
     action = btc_check_recycler_rebuy(cfg, current_price, usd_balance)
     if action:
-        return execute_buy(client, current_price, action["usd_amount"],
-                           action["reason"], active_mode, snapshot)
+        return _dispatch_buy(client, current_price, action, active_mode, snapshot)
 
     # Priority 2: Recycler sell (take partial profit, reload reserve)
     action = btc_check_recycler_sell(cfg, current_price, btc_balance, avg_cost)
     if action:
-        return execute_sell(client, current_price, action["btc_amount"],
-                            action["reason"], active_mode, snapshot)
+        return _dispatch_sell(client, current_price, action, active_mode, snapshot)
 
     # Priority 3: Dip buy (deploy reserve on significant drop)
-    action = btc_check_dip_buy(cfg, current_price, usd_balance)
+    action = btc_check_dip_buy(cfg, current_price, usd_balance, vol_multiplier)
     if action:
-        return execute_buy(client, current_price, action["usd_amount"],
-                           action["reason"], active_mode, snapshot)
+        return _dispatch_buy(client, current_price, action, active_mode, snapshot)
 
     # Priority 4: Scheduled DCA
     action = btc_check_dca(cfg, usd_balance)
     if action:
-        return execute_buy(client, current_price, action["usd_amount"],
-                           action["reason"], active_mode, snapshot)
+        return _dispatch_buy(client, current_price, action, active_mode, snapshot)
 
     return False
 
 
-def run_usd_accumulate_strategies(client, current_price, snapshot, active_mode):
+def run_usd_accumulate_strategies(client, current_price, snapshot, active_mode,
+                                  vol_multiplier=1.0):
     """Run all USD accumulation strategy checks in priority order (inverted)."""
     # Same as BTC mode — always use live Kraken balances, not stale snapshot
     try:
@@ -351,20 +400,17 @@ def run_usd_accumulate_strategies(client, current_price, snapshot, active_mode):
     # Priority 1: Recycler resell (BTC is waiting to be resold at bounce)
     action = usd_check_recycler_resell(cfg, current_price, btc_balance)
     if action:
-        return execute_sell(client, current_price, action["btc_amount"],
-                            action["reason"], active_mode, snapshot)
+        return _dispatch_sell(client, current_price, action, active_mode, snapshot)
 
     # Priority 2: Recycler buy (buy cheap BTC to resell higher for more USD)
     action = usd_check_recycler_buy(cfg, current_price, usd_balance, avg_sell_basis)
     if action:
-        return execute_buy(client, current_price, action["usd_amount"],
-                           action["reason"], active_mode, snapshot)
+        return _dispatch_buy(client, current_price, action, active_mode, snapshot)
 
     # Priority 3: Spike sell (sell BTC reserve on significant price pump)
-    action = usd_check_spike_sell(cfg, current_price, btc_balance)
+    action = usd_check_spike_sell(cfg, current_price, btc_balance, vol_multiplier)
     if action:
-        return execute_sell(client, current_price, action["btc_amount"],
-                            action["reason"], active_mode, snapshot)
+        return _dispatch_sell(client, current_price, action, active_mode, snapshot)
 
     # DCA is intentionally suspended during USD accumulation mode.
     # DCA means "buy BTC on a schedule" — it doesn't invert.
@@ -372,6 +418,78 @@ def run_usd_accumulate_strategies(client, current_price, snapshot, active_mode):
     logger.debug("USD mode: DCA halted — resumes when bot switches to BTC accumulation")
 
     return False
+
+
+# ── Pending-order reconciliation ───────────────────────────────────────────────
+
+def reconcile_pending_trades(client: KrakenClient):
+    """
+    Read back fills for resting maker orders and settle their trade rows.
+
+    Post-only orders rest on the book and may not fill on the tick they were
+    placed. Each unreconciled (pending/open, non-paper) trade row is looked up via
+    QueryOrders and its fill_status/fee_actual/price_actual/was_maker columns are
+    updated once Kraken reports a terminal state:
+      - closed              → record actual fee/price; was_maker from oflags.
+      - open                → still resting; leave for a later tick (orphan-cancel
+                              if it has been waiting longer than the orphan window).
+      - canceled / expired  → settle as such; not counted as a real fill.
+
+    Runs at the top of every loop tick. Any per-order error is logged and skipped
+    so one bad row never blocks the rest of the loop.
+    """
+    pending = get_unreconciled_trades()
+    if not pending:
+        return
+
+    now = time.time()
+    for row in pending:
+        order_id = row["order_id"]
+        try:
+            resp = client._private("QueryOrders", {"txid": order_id})
+        except KrakenAPIError as e:
+            logger.warning("[reconcile] QueryOrders failed for %s: %s", order_id, e)
+            continue
+        except Exception as e:
+            logger.warning("[reconcile] unexpected error for %s: %s", order_id, e)
+            continue
+
+        info = resp.get(order_id)
+        if not info:
+            logger.debug("[reconcile] no order info for %s yet", order_id)
+            continue
+
+        status = info.get("status", "")
+        if status == "closed":
+            oflags = info.get("oflags", "") or ""
+            was_maker = 1 if "post" in oflags else 0
+            fee_actual = float(info.get("fee", 0) or 0)
+            price_actual = float(info.get("price", 0) or 0) or None
+            update_trade_fill(row["id"], "closed", was_maker=was_maker,
+                              fee_actual=fee_actual, price_actual=price_actual)
+            logger.info("[reconcile] %s closed | maker=%d fee=$%.4f price=%s",
+                        order_id, was_maker, fee_actual,
+                        f"${price_actual:.2f}" if price_actual else "n/a")
+
+        elif status == "open":
+            update_trade_fill(row["id"], "open")
+            # Orphan-cancel: clean up orders resting longer than the window.
+            try:
+                opened = float(info.get("opentm", 0) or 0)
+            except (TypeError, ValueError):
+                opened = 0.0
+            if opened and (now - opened) > PENDING_ORDER_ORPHAN_SECONDS:
+                logger.warning("[reconcile] %s open > %dh — canceling orphan",
+                               order_id, PENDING_ORDER_ORPHAN_SECONDS // 3600)
+                client.cancel_order(order_id)
+                update_trade_fill(row["id"], "canceled")
+
+        elif status in ("canceled", "expired"):
+            update_trade_fill(row["id"], status)
+            logger.info("[reconcile] %s %s — not counted as a fill", order_id, status)
+
+        else:
+            logger.debug("[reconcile] %s status=%s (no action)", order_id, status)
 
 
 # ── Status reporting ──────────────────────────────────────────────────────────
@@ -456,6 +574,23 @@ def main():
                 _last_daily_sample_date = today_str
                 logger.debug("Daily price recorded: $%.2f (%s)", current_price, today_str)
 
+            # ── Reconcile resting maker orders from prior ticks ───────────────
+            reconcile_pending_trades(client)
+
+            # ── Volatility-adaptive threshold multiplier ──────────────────────
+            # Computed once per tick and propagated into dip/spike strategies.
+            # Degrades to 1.0 (flat thresholds) on any failure or when disabled.
+            if cfg.volatility_adaptive_enabled:
+                atr_pct, atr_baseline_pct, vol_multiplier = calculate_atr(
+                    client, cfg.vol_multiplier_min, cfg.vol_multiplier_max
+                )
+            else:
+                atr_pct, atr_baseline_pct, vol_multiplier = None, None, 1.0
+            set_state("vol_multiplier", vol_multiplier)
+            set_state("atr_pct", atr_pct if atr_pct is not None else "")
+            set_state("atr_baseline_pct",
+                      atr_baseline_pct if atr_baseline_pct is not None else "")
+
             # ── Determine active mode ─────────────────────────────────────────
             active_mode = get_active_mode(cfg, current_price)
 
@@ -480,9 +615,11 @@ def main():
 
             # ── Dispatch to correct strategy set ─────────────────────────────
             if active_mode == Mode.BTC_ACCUMULATE:
-                run_btc_accumulate_strategies(client, current_price, snapshot, active_mode)
+                run_btc_accumulate_strategies(client, current_price, snapshot,
+                                              active_mode, vol_multiplier)
             elif active_mode == Mode.USD_ACCUMULATE:
-                run_usd_accumulate_strategies(client, current_price, snapshot, active_mode)
+                run_usd_accumulate_strategies(client, current_price, snapshot,
+                                              active_mode, vol_multiplier)
             # AUTO mode is resolved to BTC or USD above — never reaches here as AUTO
 
             # ── Sideways Market overlay (Range Recycler) ─────────────────────

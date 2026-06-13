@@ -90,6 +90,15 @@ class Config:
     # Mode
     paper_trading: bool
 
+    # Volatility-adaptive thresholds (Tier 1)
+    volatility_adaptive_enabled: bool
+    vol_multiplier_min:          float
+    vol_multiplier_max:          float
+
+    # Anti-thrash dampener (Tier 1)
+    min_gap_between_trades_seconds: int
+    max_trades_per_day:             int
+
     # Logging
     log_level: str
     log_file:  str
@@ -125,6 +134,11 @@ _ENV_DEFAULTS = {
     "RANGE_TRADE_SIZE_USD":           "500",
     "RANGE_MAX_POSITIONS":            "5",
     "PAPER_TRADING":                  "true",
+    "VOLATILITY_ADAPTIVE_ENABLED":    "true",
+    "VOL_MULTIPLIER_MIN":             "0.7",
+    "VOL_MULTIPLIER_MAX":             "1.5",
+    "MIN_GAP_BETWEEN_TRADES_SECONDS": "3600",
+    "MAX_TRADES_PER_DAY":             "8",
     "LOG_LEVEL":                      "INFO",
     "LOG_FILE":                       "/app/data/bot.log",
 }
@@ -208,6 +222,13 @@ def load_config() -> Config:
 
         paper_trading = _bool("PAPER_TRADING", True),
 
+        volatility_adaptive_enabled = _bool("VOLATILITY_ADAPTIVE_ENABLED", True),
+        vol_multiplier_min          = _float("VOL_MULTIPLIER_MIN", 0.7),
+        vol_multiplier_max          = _float("VOL_MULTIPLIER_MAX", 1.5),
+
+        min_gap_between_trades_seconds = _int("MIN_GAP_BETWEEN_TRADES_SECONDS", 3600),
+        max_trades_per_day             = _int("MAX_TRADES_PER_DAY", 8),
+
         log_level = _get("LOG_LEVEL", "INFO"),
         log_file  = _get("LOG_FILE", "/app/logs/bot.log"),
     )
@@ -224,6 +245,12 @@ def load_config() -> Config:
         raise ValueError(f"DCA_DAY_OF_MONTH must be 1–28, got: {cfg.dca_day_of_month}")
     if cfg.mode not in ("btc_accumulate", "usd_accumulate", "auto"):
         raise ValueError(f"Invalid MODE: {cfg.mode}. Must be btc_accumulate, usd_accumulate, or auto")
+    if not 0 < cfg.vol_multiplier_min <= 1.0 <= cfg.vol_multiplier_max:
+        raise ValueError("VOL_MULTIPLIER_MIN must be in (0,1] and VOL_MULTIPLIER_MAX must be >= 1.0")
+    if cfg.min_gap_between_trades_seconds < 0:
+        raise ValueError("MIN_GAP_BETWEEN_TRADES_SECONDS must be >= 0")
+    if cfg.max_trades_per_day < 1:
+        raise ValueError("MAX_TRADES_PER_DAY must be >= 1")
 
     mode = "PAPER TRADING" if cfg.paper_trading else "LIVE TRADING"
     logger.info("Config loaded — Mode: %s | DCA: $%.2f/%s @ %s UTC",

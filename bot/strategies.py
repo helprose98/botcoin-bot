@@ -27,6 +27,7 @@ from database import (
     get_last_trade_by_reason, get_recent_high, get_recent_low,
     get_latest_snapshot, get_state, set_state
 )
+from volatility import apply_multiplier
 
 logger = logging.getLogger(__name__)
 
@@ -144,25 +145,36 @@ def btc_check_dca(cfg: Config, usd_balance: float) -> dict | None:
 
 
 def btc_check_dip_buy(cfg: Config, current_price: float,
-                      usd_balance: float) -> dict | None:
+                      usd_balance: float,
+                      vol_multiplier: float = 1.0) -> dict | None:
     """
     BTC mode: Deploy USD reserve when price drops from recent high.
     Three tiers — deeper dip = more capital deployed.
+
+    vol_multiplier scales the base dip thresholds: < 1.0 tightens them (calm
+    market → catch smaller dips), > 1.0 loosens them (volatile market → require
+    a deeper drop). Defaults to 1.0 (no adjustment) for callers that don't supply
+    a volatility reading.
     """
     recent_high = get_recent_high(hours=168)
     if not recent_high:
         return None
 
     drop_pct = (recent_high - current_price) / recent_high
-    logger.debug("BTC dip check: price=$%.2f high=$%.2f drop=%.1f%%",
-                 current_price, recent_high, drop_pct * 100)
+    logger.debug("BTC dip check: price=$%.2f high=$%.2f drop=%.1f%% vol_mult=%.3f",
+                 current_price, recent_high, drop_pct * 100, vol_multiplier)
+
+    # Effective (volatility-adjusted) thresholds.
+    eff_t3 = apply_multiplier(cfg.dip_tier3_threshold, vol_multiplier)
+    eff_t2 = apply_multiplier(cfg.dip_tier2_threshold, vol_multiplier)
+    eff_t1 = apply_multiplier(cfg.dip_threshold_pct, vol_multiplier)
 
     # Determine tier
-    if drop_pct >= cfg.dip_tier3_threshold:
+    if drop_pct >= eff_t3:
         tier, deploy_pct, reason = 3, cfg.dip_tier3_deploy, "dip_buy_tier3"
-    elif drop_pct >= cfg.dip_tier2_threshold:
+    elif drop_pct >= eff_t2:
         tier, deploy_pct, reason = 2, cfg.dip_tier2_deploy, "dip_buy_tier2"
-    elif drop_pct >= cfg.dip_threshold_pct:
+    elif drop_pct >= eff_t1:
         tier, deploy_pct, reason = 1, cfg.dip_buy_deploy_pct, "dip_buy_tier1"
     else:
         return None
@@ -293,24 +305,33 @@ def usd_check_dca(cfg: Config, current_price: float,
 
 
 def usd_check_spike_sell(cfg: Config, current_price: float,
-                          btc_balance: float) -> dict | None:
+                          btc_balance: float,
+                          vol_multiplier: float = 1.0) -> dict | None:
     """
     USD mode: Deploy BTC reserve when price SPIKES above recent low.
     Mirror of btc_check_dip_buy — sells BTC on pumps instead of buying on dips.
+
+    vol_multiplier scales the base spike thresholds identically to the dip-buy
+    path (< 1.0 tightens, > 1.0 loosens). Defaults to 1.0 (no adjustment).
     """
     recent_low = get_recent_low(hours=168)
     if not recent_low or recent_low <= 0:
         return None
 
     rise_pct = (current_price - recent_low) / recent_low
-    logger.debug("USD spike check: price=$%.2f low=$%.2f rise=%.1f%%",
-                 current_price, recent_low, rise_pct * 100)
+    logger.debug("USD spike check: price=$%.2f low=$%.2f rise=%.1f%% vol_mult=%.3f",
+                 current_price, recent_low, rise_pct * 100, vol_multiplier)
 
-    if rise_pct >= cfg.dip_tier3_threshold:
+    # Effective (volatility-adjusted) thresholds.
+    eff_t3 = apply_multiplier(cfg.dip_tier3_threshold, vol_multiplier)
+    eff_t2 = apply_multiplier(cfg.dip_tier2_threshold, vol_multiplier)
+    eff_t1 = apply_multiplier(cfg.dip_threshold_pct, vol_multiplier)
+
+    if rise_pct >= eff_t3:
         tier, deploy_pct, reason = 3, cfg.dip_tier3_deploy, "usd_spike_sell_tier3"
-    elif rise_pct >= cfg.dip_tier2_threshold:
+    elif rise_pct >= eff_t2:
         tier, deploy_pct, reason = 2, cfg.dip_tier2_deploy, "usd_spike_sell_tier2"
-    elif rise_pct >= cfg.dip_threshold_pct:
+    elif rise_pct >= eff_t1:
         tier, deploy_pct, reason = 1, cfg.dip_buy_deploy_pct, "usd_spike_sell_tier1"
     else:
         return None

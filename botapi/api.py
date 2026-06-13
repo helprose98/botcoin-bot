@@ -179,8 +179,10 @@ def _record_quick_buy_trade(order_id: str, btc_amount: float, usd_amount: float,
         net_usd = -(usd_amount + fee_usd)
         conn.execute("""
             INSERT INTO trades
-            (order_id, side, reason, btc_amount, usd_amount, price_usd, fee_usd, net_usd, active_mode, paper_trade)
-            VALUES (?, 'buy', 'quick_buy', ?, ?, ?, ?, ?, 'btc_accumulate', 0)
+            (order_id, side, reason, btc_amount, usd_amount, price_usd, fee_usd, net_usd,
+             active_mode, paper_trade, ordertype, fill_status)
+            VALUES (?, 'buy', 'quick_buy', ?, ?, ?, ?, ?, 'btc_accumulate', 0,
+                    'limit-post', 'pending')
         """, (order_id, round(btc_amount, 8), round(usd_amount, 2),
                round(price_usd, 2), round(fee_usd, 4), round(net_usd, 4)))
         conn.commit()
@@ -272,6 +274,75 @@ def _kraken_sign(urlpath, data, secret):
     message   = urlpath.encode() + hl.sha256(encoded).digest()
     mac       = hmac_mod.new(base64.b64decode(secret), message, hl.sha512)
     return base64.b64encode(mac.digest()).decode()
+
+
+# ── Maker-only order parameters (mirror of bot/kraken_client.py) ──────────────
+# The API container is isolated and does not import the bot package, so the
+# maker-only constants and pricing logic are replicated here in lockstep with
+# kraken_client.py. Any change to one must be applied to the other.
+KRAKEN_BTCUSD_TICK        = 0.1     # BTC/USD price tick (1 decimal)
+MAKER_PRICE_MAX_DRIFT     = 0.005   # 0.5% hard sanity bound vs last price
+MAX_MAKER_RETRIES         = 3       # post-only submit attempts before giving up
+MAKER_POLL_INTERVAL_SECS  = 2       # pause between a rejection and the reprice
+
+
+def _kraken_private(env, endpoint, params):
+    """Make an authenticated Kraken private POST. Raises on API error."""
+    api_key    = env.get("KRAKEN_API_KEY", "").strip()
+    api_secret = env.get("KRAKEN_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        raise RuntimeError("API keys not configured")
+    urlpath = f"/0/private/{endpoint}"
+    params  = dict(params)
+    params["nonce"] = str(int(time.time() * 1000))
+    post = urllib.parse.urlencode(params).encode()
+    sig  = _kraken_sign(urlpath, params, api_secret)
+    req  = urllib.request.Request(
+        "https://api.kraken.com" + urlpath,
+        data=post,
+        headers={
+            "API-Key":  api_key,
+            "API-Sign": sig,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        result = json.loads(resp.read())
+    if result.get("error"):
+        raise RuntimeError(", ".join(result["error"]))
+    return result.get("result", {})
+
+
+def _kraken_book_top(pair):
+    """Return (best_bid, best_ask, last_price) from the public Ticker."""
+    req = urllib.request.Request(
+        f"https://api.kraken.com/0/public/Ticker?pair={pair}",
+        headers={"User-Agent": "BotCoin"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        ticker = json.loads(resp.read())
+    if ticker.get("error"):
+        raise RuntimeError("Could not fetch price from Kraken")
+    t = list(ticker["result"].values())[0]
+    return float(t["b"][0]), float(t["a"][0]), float(t["c"][0])
+
+
+def _maker_limit_price(side, best_bid, best_ask, last_price, retry_count=0):
+    """Post-only-safe limit price one+ ticks away from the near touch."""
+    offset = KRAKEN_BTCUSD_TICK * (1 + retry_count)
+    if side == "buy":
+        price = round(best_bid - offset, 1)
+    elif side == "sell":
+        price = round(best_ask + offset, 1)
+    else:
+        raise ValueError(f"Unknown side: {side}")
+    drift = abs(price - last_price) / last_price
+    if drift > MAKER_PRICE_MAX_DRIFT:
+        raise ValueError(
+            f"Maker price {price} drifts {drift:.2%} from last {last_price} "
+            f"(max {MAKER_PRICE_MAX_DRIFT:.1%})"
+        )
+    return price
 
 
 def _get_live_balances():
@@ -564,6 +635,13 @@ def _format_trade(t):
         "fee_usd":     round(t["fee_usd"], 4),
         "active_mode": t.get("active_mode", "btc_accumulate"),
         "paper_trade": bool(t.get("paper_trade", 0)),
+        # Maker-only fields (v1.5.0). Use .get so this stays safe against an
+        # older DB that predates the migration; null until the reconciler fills.
+        "ordertype":        t.get("ordertype"),
+        "was_maker":        bool(t["was_maker"]) if t.get("was_maker") is not None else None,
+        "fee_actual_usd":   round(t["fee_actual"], 4) if t.get("fee_actual") is not None else None,
+        "price_actual_usd": round(t["price_actual"], 2) if t.get("price_actual") is not None else None,
+        "fill_status":      t.get("fill_status"),
     }
 
 
@@ -632,6 +710,67 @@ def _get_sideways_status():
     }
 
 
+def _get_throttle_status():
+    """Build the anti-thrash throttle status block for /api/status.bot."""
+    env = _read_env()
+    min_gap     = int(env.get("MIN_GAP_BETWEEN_TRADES_SECONDS", "3600"))
+    max_per_day = int(env.get("MAX_TRADES_PER_DAY", "8"))
+    last_ts     = int(_state("last_trade_ts", "0") or 0)
+
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    state_date = _state("trades_today_date", "") or ""
+    trades_today = int(_state("trades_today_count", "0") or 0) if state_date == today_utc else 0
+
+    elapsed = int(time.time()) - last_ts
+    seconds_until = max(0, min_gap - elapsed) if last_ts else 0
+
+    return {
+        "min_gap_seconds":            min_gap,
+        "max_per_day":                max_per_day,
+        "trades_today":               trades_today,
+        "last_trade_ts":              last_ts or None,
+        "seconds_until_next_allowed": seconds_until,
+    }
+
+
+def _get_volatility_status():
+    """Build the volatility status block for /api/status.bot.
+
+    Reads the metrics the bot loop persists to bot_state each tick; falls back to
+    a neutral (multiplier 1.0) reading if the bot hasn't written them yet.
+    """
+    env = _read_env()
+    enabled = env.get("VOLATILITY_ADAPTIVE_ENABLED", "true").lower() in ("true", "1", "yes")
+
+    def _f(key):
+        raw = _state(key, "")
+        try:
+            return float(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    atr_pct      = _f("atr_pct")
+    baseline_pct = _f("atr_baseline_pct")
+    multiplier   = _f("vol_multiplier")
+    if multiplier is None:
+        multiplier = 1.0
+
+    if multiplier < 0.95:
+        regime = "calm"
+    elif multiplier > 1.10:
+        regime = "storm"
+    else:
+        regime = "normal"
+
+    return {
+        "enabled":      enabled,
+        "atr_pct":      round(atr_pct, 4) if atr_pct is not None else None,
+        "baseline_pct": round(baseline_pct, 4) if baseline_pct is not None else None,
+        "multiplier":   round(multiplier, 3),
+        "regime":       regime,
+    }
+
+
 def _btc_stack_history():
     rows = query("""
         SELECT DATE(timestamp) as date, btc_balance, avg_cost_basis
@@ -673,7 +812,7 @@ def health():
     return jsonify({
         "status":     "ok",
         "configured": configured,
-        "version":    "2.0",
+        "version":    _read_local_version(),
     })
 
 
@@ -780,7 +919,10 @@ def status():
             "recent_high":     round(recent_high, 2) if recent_high else None,
             "trend":           _trend_duration(ma200),
             "sideways":        _get_sideways_status(),
+            "throttle":        _get_throttle_status(),
+            "volatility":      _get_volatility_status(),
         },
+        "version":    _read_local_version(),
         "mood":       mood,
         "last_trade": _format_trade(last_trade),
         "next_dca":   _next_dca_timestamp(),
@@ -925,6 +1067,14 @@ def open_orders():
 @requires_auth
 def get_settings():
     env = _read_env()
+
+    # Volatility metrics + effective (vol-adjusted) dip thresholds.
+    vol = _get_volatility_status()
+    multiplier = vol["multiplier"]
+    base_t1 = float(env.get("DIP_THRESHOLD_PERCENT", "0.07"))
+    base_t2 = float(env.get("DIP_TIER2_THRESHOLD_PERCENT", "0.15"))
+    base_t3 = float(env.get("DIP_TIER3_THRESHOLD_PERCENT", "0.22"))
+
     return jsonify({
         "dca_amount":        env.get("DCA_AMOUNT_USD", "50.00"),
         "dca_frequency":     env.get("DCA_FREQUENCY", "weekly"),
@@ -942,6 +1092,17 @@ def get_settings():
         "sideways_enabled":      env.get("SIDEWAYS_ENABLED", "true"),
         "range_trade_size_usd":  env.get("RANGE_TRADE_SIZE_USD", "500"),
         "range_max_positions":   env.get("RANGE_MAX_POSITIONS", "5"),
+        # Volatility-adaptive thresholds (v1.5.0)
+        "volatility_adaptive_enabled": env.get("VOLATILITY_ADAPTIVE_ENABLED", "true"),
+        "atr_pct":            vol["atr_pct"],
+        "atr_baseline_pct":   vol["baseline_pct"],
+        "vol_multiplier":     multiplier,
+        "effective_dip_tier1": round(base_t1 * multiplier, 4),
+        "effective_dip_tier2": round(base_t2 * multiplier, 4),
+        "effective_dip_tier3": round(base_t3 * multiplier, 4),
+        # Anti-thrash dampener (v1.5.0)
+        "min_gap_between_trades_seconds": env.get("MIN_GAP_BETWEEN_TRADES_SECONDS", "3600"),
+        "max_trades_per_day":             env.get("MAX_TRADES_PER_DAY", "8"),
     })
 
 
@@ -973,7 +1134,15 @@ def save_settings():
         "SIDEWAYS_ENABLED":                body.get("sideways_enabled"),
         "RANGE_TRADE_SIZE_USD":            body.get("range_trade_size_usd"),
         "RANGE_MAX_POSITIONS":             body.get("range_max_positions"),
+        # Anti-thrash dampener (v1.5.0)
+        "MIN_GAP_BETWEEN_TRADES_SECONDS":  body.get("min_gap_between_trades_seconds"),
+        "MAX_TRADES_PER_DAY":              body.get("max_trades_per_day"),
     }
+    # Volatility-adaptive toggle is boolean-only: normalise truthy/falsy input.
+    if body.get("volatility_adaptive_enabled") is not None:
+        v = body.get("volatility_adaptive_enabled")
+        truthy = str(v).strip().lower() in ("true", "1", "yes", "on") if not isinstance(v, bool) else v
+        allowed["VOLATILITY_ADAPTIVE_ENABLED"] = "true" if truthy else "false"
     updates = {k: str(v) for k, v in allowed.items() if v is not None}
     try:
         _write_env(updates)
@@ -988,9 +1157,12 @@ def save_settings():
 @requires_auth
 def quick_buy():
     """
-    Execute an immediate market buy of BTC.
+    Execute an immediate maker-only (post-only) limit buy of BTC.
     Body: { "usd_amount": 50.0 }
-    Places a limit buy at 0.05% below current price (same as DCA logic).
+
+    The order rests one+ ticks below best bid so it never crosses (oflags=post).
+    On a post-only rejection it reprices one tick further from the book, up to
+    MAX_MAKER_RETRIES. There is no taker fallback — a missed fill is acceptable.
     """
     body = request.get_json(force=True, silent=True) or {}
     try:
@@ -1005,71 +1177,57 @@ def quick_buy():
     if usd_amount > max_order:
         return jsonify({"ok": False, "error": f"Amount exceeds max order size (${max_order})"}), 400
 
+    if not env.get("KRAKEN_API_KEY", "").strip() or not env.get("KRAKEN_API_SECRET", "").strip():
+        return jsonify({"ok": False, "error": "API keys not configured"}), 500
+
+    pair      = env.get("TRADING_PAIR", "XBTUSD")
+    maker_fee = float(env.get("KRAKEN_MAKER_FEE", "0.0025"))
+
     try:
-        # Get current price
-        req = urllib.request.Request(
-            "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
-            headers={"User-Agent": "BotCoin/2.0"}
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            ticker = json.loads(resp.read())
-        if ticker.get("error"):
-            return jsonify({"ok": False, "error": "Could not fetch price from Kraken"}), 500
-        current_price = float(list(ticker["result"].values())[0]["c"][0])
-        limit_price   = round(current_price * 0.9995, 1)
-        btc_amount    = round((usd_amount / limit_price) * 0.9975, 8)  # account for fee
+        for attempt in range(MAX_MAKER_RETRIES):
+            best_bid, best_ask, last_price = _kraken_book_top(pair)
+            try:
+                limit_price = _maker_limit_price("buy", best_bid, best_ask,
+                                                 last_price, retry_count=attempt)
+            except ValueError as drift_err:
+                return jsonify({"ok": False, "error": str(drift_err)}), 400
 
-        # Place order
-        api_key    = env.get("KRAKEN_API_KEY", "").strip()
-        api_secret = env.get("KRAKEN_API_SECRET", "").strip()
-        if not api_key or not api_secret:
-            return jsonify({"ok": False, "error": "API keys not configured"}), 500
+            # Discount the BTC volume by the maker fee so total spend ≈ usd_amount.
+            effective_usd = usd_amount / (1 + maker_fee)
+            btc_amount    = round(effective_usd / limit_price, 8)
 
-        urlpath = "/0/private/AddOrder"
-        nonce   = str(int(time.time() * 1000))
-        data    = {
-            "nonce":     nonce,
-            "ordertype": "limit",
-            "type":      "buy",
-            "volume":    str(btc_amount),
-            "pair":      env.get("TRADING_PAIR", "XBTUSD"),
-            "price":     str(limit_price),
-            "userref":   99,  # integer tag for quick buy orders
-        }
-        post = urllib.parse.urlencode(data).encode()
-        sig  = _kraken_sign(urlpath, data, api_secret)
-        order_req = urllib.request.Request(
-            "https://api.kraken.com" + urlpath,
-            data=post,
-            headers={
-                "API-Key":  api_key,
-                "API-Sign": sig,
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-        )
-        with urllib.request.urlopen(order_req, timeout=10) as resp:
-            result = json.loads(resp.read())
+            try:
+                result = _kraken_private(env, "AddOrder", {
+                    "ordertype": "limit",
+                    "type":      "buy",
+                    "volume":    str(btc_amount),
+                    "pair":      pair,
+                    "price":     f"{limit_price:.1f}",
+                    "oflags":    "post",
+                    "userref":   99,  # integer tag for quick buy orders
+                })
+            except RuntimeError as order_err:
+                if "post only" in str(order_err).lower() and attempt < MAX_MAKER_RETRIES - 1:
+                    time.sleep(MAKER_POLL_INTERVAL_SECS)
+                    continue
+                return jsonify({"ok": False, "error": str(order_err)}), 400
 
-        if result.get("error") and result["error"]:
-            return jsonify({"ok": False, "error": ", ".join(result["error"])}), 400
+            order_ids = result.get("txid", [])
+            order_id  = order_ids[0] if order_ids else "unknown"
+            fee_usd   = round(usd_amount * maker_fee, 4)
+            _record_quick_buy_trade(order_id, btc_amount, usd_amount, limit_price, fee_usd)
 
-        order_ids = result.get("result", {}).get("txid", [])
-        order_id  = order_ids[0] if order_ids else "unknown"
+            return jsonify({
+                "ok":          True,
+                "order_id":    order_id,
+                "btc_amount":  btc_amount,
+                "usd_amount":  usd_amount,
+                "price":       limit_price,
+                "ordertype":   "limit-post",
+                "message":     f"Placed maker buy ~{btc_amount:.8f} BTC at ${limit_price:,.2f}"
+            })
 
-        # Record trade in database via strictly controlled write function
-        maker_fee  = float(env.get("KRAKEN_MAKER_FEE", "0.0025"))
-        fee_usd    = round(usd_amount * maker_fee, 4)
-        actual_btc = round(usd_amount / limit_price, 8)
-        _record_quick_buy_trade(order_id, actual_btc, usd_amount, limit_price, fee_usd)
-
-        return jsonify({
-            "ok":          True,
-            "order_id":    order_id,
-            "btc_amount":  actual_btc,
-            "usd_amount":  usd_amount,
-            "price":       limit_price,
-            "message":     f"Bought ~{actual_btc:.8f} BTC at ${limit_price:,.2f}"
-        })
+        return jsonify({"ok": False, "error": "Post-only order repeatedly crossed; not filled"}), 409
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1214,6 +1372,64 @@ def version():
         "current":          current,
         "latest":           latest or current,
         "update_available": update_available,
+    })
+
+
+# ── Maker stats (auth required) ───────────────────────────────────────────────
+
+@app.route("/api/maker_stats")
+@requires_auth
+def maker_stats():
+    """
+    Maker-fill performance for the current calendar month: how many real
+    (non-paper) orders rested as maker, the fees actually paid, and an estimate
+    of fees saved versus a taker baseline for the same notional.
+    """
+    env = _read_env()
+    taker_baseline = float(env.get("KRAKEN_TAKER_FEE", "0.0026"))
+
+    month_start = datetime.now(timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    rows = query(
+        """
+        SELECT was_maker, fee_usd, fee_actual, usd_amount
+        FROM trades
+        WHERE paper_trade = 0 AND timestamp >= ?
+        """,
+        (month_start,),
+    )
+
+    total       = len(rows)
+    maker_fills = 0
+    fees_paid   = 0.0
+    taker_cost  = 0.0
+    for r in rows:
+        # fee_actual is the reconciled value; fall back to the estimated fee_usd.
+        fee = r.get("fee_actual")
+        if fee in (None, ""):
+            fee = r.get("fee_usd") or 0.0
+        fees_paid += float(fee)
+
+        notional = float(r.get("usd_amount") or 0.0)
+        taker_cost += notional * taker_baseline
+
+        if r.get("was_maker") == 1:
+            maker_fills += 1
+
+    fill_rate = (maker_fills / total) if total else 0.0
+    fees_saved = taker_cost - fees_paid
+
+    return jsonify({
+        "month_start":        month_start,
+        "total_orders":       total,
+        "maker_fills":        maker_fills,
+        "maker_fill_rate":    round(fill_rate, 4),
+        "fees_paid_usd":      round(fees_paid, 4),
+        "taker_baseline_fee": taker_baseline,
+        "taker_cost_usd":     round(taker_cost, 4),
+        "fees_saved_usd":     round(fees_saved, 4),
     })
 
 

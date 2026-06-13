@@ -21,6 +21,59 @@ PAIR_MAP = {
     "BTCUSD": "XXBTZUSD",
 }
 
+# ── Maker-only order parameters ────────────────────────────────────────────────
+# Tick size for BTC/USD on Kraken (price precision = 1 decimal).
+KRAKEN_BTCUSD_TICK = 0.1
+
+# Hard sanity bound: a maker limit price may never drift more than this fraction
+# from the last-trade price (protects against ticker corruption / a stale book).
+MAKER_PRICE_MAX_DRIFT = 0.005  # 0.5%
+
+# Maximum post-only submit attempts before giving up. Maker-only is final: there
+# is no taker fallback. A missed fill is acceptable — the strategy re-evaluates
+# on the next tick.
+MAX_MAKER_RETRIES = 3
+
+# Pause between a post-only rejection and the next reprice attempt, giving the
+# book a moment to settle.
+MAKER_POLL_INTERVAL_SECONDS = 2
+
+
+def compute_maker_limit_price(side: str, best_bid: float, best_ask: float,
+                              last_price: float, retry_count: int = 0) -> float:
+    """
+    Compute a post-only-safe limit price one or more ticks away from the near
+    touch of the book.
+
+    Buys rest BELOW best_bid (so they don't take the ask). Sells rest ABOVE
+    best_ask (so they don't take the bid). Each retry steps one additional tick
+    further from the book to handle book movement between fetch and submit.
+
+    Raises ValueError if the resulting price would drift more than
+    MAKER_PRICE_MAX_DRIFT from last_price (defensive guard against bad data).
+    """
+    offset_ticks = 1 + retry_count
+    offset = KRAKEN_BTCUSD_TICK * offset_ticks
+    if side == "buy":
+        price = round(best_bid - offset, 1)
+    elif side == "sell":
+        price = round(best_ask + offset, 1)
+    else:
+        raise ValueError(f"Unknown side: {side}")
+
+    drift = abs(price - last_price) / last_price
+    if drift > MAKER_PRICE_MAX_DRIFT:
+        raise ValueError(
+            f"Maker price {price} drifts {drift:.2%} from last {last_price} "
+            f"(max {MAKER_PRICE_MAX_DRIFT:.1%}); refusing to submit."
+        )
+    return price
+
+
+def _is_post_only_rejection(err: "KrakenAPIError") -> bool:
+    """Return True if a Kraken error indicates a post-only order would cross."""
+    return "post only" in str(err).lower()
+
 
 class KrakenClient:
     def __init__(self, api_key: str, api_secret: str, pair: str = "XBTUSD",
@@ -100,6 +153,21 @@ class KrakenClient:
         logger.debug("Current BTC price: $%.2f", price)
         return price
 
+    def get_book_top(self) -> tuple[float, float, float]:
+        """
+        Return (best_bid, best_ask, last_price) from the Kraken Ticker.
+
+        The same Ticker payload get_ticker_price() uses already carries the best
+        bid ('b') and best ask ('a'); this returns all three so maker-only pricing
+        can rest relative to the near touch of the book instead of the last trade.
+        """
+        result = self._public("Ticker", {"pair": self.pair})
+        ticker = result[list(result.keys())[0]]
+        best_bid  = float(ticker["b"][0])
+        best_ask  = float(ticker["a"][0])
+        last_price = float(ticker["c"][0])
+        return best_bid, best_ask, last_price
+
     def get_ohlc(self, interval_minutes: int = 60, since: int = None) -> list:
         """Return OHLC candles. interval: 1,5,15,30,60,240,1440,10080,21600"""
         params = {"pair": self.pair, "interval": interval_minutes}
@@ -172,97 +240,160 @@ class KrakenClient:
         return str(d)
 
     def place_limit_buy(self, usd_amount: float, price: float,
-                        reason: str = "buy") -> dict:
+                        reason: str = "buy") -> dict | bool:
         """
-        Place a limit buy order.
-        usd_amount: how much USD to spend (fee will be deducted from this)
-        price: limit price in USD
-        Returns order details dict.
+        Place a post-only (maker-only) limit buy order.
+
+        usd_amount: how much USD to spend (fee accounted for in the BTC volume).
+        price: the last-trade reference price from the caller. It is used as the
+            paper-trading fill price; for LIVE orders the actual limit is derived
+            from the live book so the order rests below best bid.
+
+        All LIVE orders carry oflags=post and are retried up to MAX_MAKER_RETRIES
+        times, stepping one tick further from the book each time Kraken rejects
+        with "Post only order would have crossed". There is NO taker fallback:
+        maker-only is intentional — we accept a missed fill in exchange for the
+        maker fee, and the strategy re-evaluates next tick.
+
+        Returns the standard order dict on success, or False on permanent failure
+        (drift guard tripped, repeated post-only rejection, or API error).
         """
-        # Calculate BTC volume accounting for fee
-        effective_usd = usd_amount / (1 + self.maker_fee)
-        btc_volume = effective_usd / price
-        btc_str = self._truncate_btc(btc_volume)
-        price_str = f"{price:.1f}"
-
-        logger.info("[%s] Placing limit BUY: %.8f BTC @ $%s (USD: $%.2f)",
-                    "PAPER" if self.paper_trading else "LIVE",
-                    float(btc_str), price_str, usd_amount)
-
         if self.paper_trading:
+            effective_usd = usd_amount / (1 + self.maker_fee)
+            btc_str = self._truncate_btc(effective_usd / price)
             fee = usd_amount * self.maker_fee
+            logger.info("[PAPER] Placing limit BUY: %.8f BTC @ $%.1f (USD: $%.2f)",
+                        float(btc_str), price, usd_amount)
             return {
-                "order_id": f"PAPER-{int(time.time())}",
+                "order_id":  f"PAPER-{int(time.time())}",
                 "btc_amount": float(btc_str),
                 "usd_amount": usd_amount,
-                "price": price,
-                "fee_usd": fee,
-                "paper": True,
+                "price":      price,
+                "fee_usd":    fee,
+                "ordertype":  "limit-post",
+                "paper":      True,
             }
 
-        result = self._private("AddOrder", {
-            "pair":      self.pair,
-            "type":      "buy",
-            "ordertype": "limit",
-            "price":     price_str,
-            "volume":    btc_str,
-            "validate":  False,
-        })
-        order_id = result["txid"][0]
-        fee = usd_amount * self.maker_fee
-        return {
-            "order_id":   order_id,
-            "btc_amount": float(btc_str),
-            "usd_amount": usd_amount,
-            "price":      price,
-            "fee_usd":    fee,
-            "paper":      False,
-        }
+        for attempt in range(MAX_MAKER_RETRIES):
+            best_bid, best_ask, last_price = self.get_book_top()
+            try:
+                limit_price = compute_maker_limit_price(
+                    "buy", best_bid, best_ask, last_price, retry_count=attempt
+                )
+            except ValueError as e:
+                logger.warning("[maker] buy price drift guard tripped: %s", e)
+                return False
+
+            effective_usd = usd_amount / (1 + self.maker_fee)
+            btc_str = self._truncate_btc(effective_usd / limit_price)
+            try:
+                result = self._private("AddOrder", {
+                    "pair":      self.pair,
+                    "type":      "buy",
+                    "ordertype": "limit",
+                    "price":     f"{limit_price:.1f}",
+                    "volume":    btc_str,
+                    "oflags":    "post",
+                    "validate":  False,
+                })
+                order_id = result["txid"][0]
+                fee = usd_amount * self.maker_fee
+                logger.info("[maker] BUY attempt %d/%d accepted txid=%s @ $%.1f "
+                            "(bid=%.1f ask=%.1f)", attempt + 1, MAX_MAKER_RETRIES,
+                            order_id, limit_price, best_bid, best_ask)
+                return {
+                    "order_id":   order_id,
+                    "btc_amount": float(btc_str),
+                    "usd_amount": usd_amount,
+                    "price":      limit_price,
+                    "fee_usd":    fee,
+                    "ordertype":  "limit-post",
+                    "paper":      False,
+                }
+            except KrakenAPIError as e:
+                if _is_post_only_rejection(e) and attempt < MAX_MAKER_RETRIES - 1:
+                    logger.info("[maker] buy post-only rejected (attempt %d/%d): "
+                                "%s — repricing", attempt + 1, MAX_MAKER_RETRIES, e)
+                    time.sleep(MAKER_POLL_INTERVAL_SECONDS)
+                    continue
+                logger.error("[maker] buy AddOrder failed permanently: %s", e)
+                return False
+        return False
 
     def place_limit_sell(self, btc_amount: float, price: float,
-                         reason: str = "sell") -> dict:
+                         reason: str = "sell") -> dict | bool:
         """
-        Place a limit sell order.
-        btc_amount: how much BTC to sell
-        price: limit price in USD
-        Returns order details dict.
-        """
-        btc_str   = self._truncate_btc(btc_amount)
-        price_str = f"{price:.1f}"
-        usd_gross = float(btc_str) * price
-        fee       = usd_gross * self.maker_fee
+        Place a post-only (maker-only) limit sell order.
 
-        logger.info("[%s] Placing limit SELL: %.8f BTC @ $%s (gross USD: $%.2f)",
-                    "PAPER" if self.paper_trading else "LIVE",
-                    float(btc_str), price_str, usd_gross)
+        btc_amount: how much BTC to sell.
+        price: last-trade reference (paper fill price); LIVE limit is derived from
+            the live book so the order rests above best ask.
+
+        Identical maker-only semantics to place_limit_buy (oflags=post, up to
+        MAX_MAKER_RETRIES reprices, no taker fallback). Returns the order dict on
+        success or False on permanent failure.
+        """
+        btc_str = self._truncate_btc(btc_amount)
 
         if self.paper_trading:
+            usd_gross = float(btc_str) * price
+            fee = usd_gross * self.maker_fee
+            logger.info("[PAPER] Placing limit SELL: %.8f BTC @ $%.1f (gross USD: $%.2f)",
+                        float(btc_str), price, usd_gross)
             return {
-                "order_id": f"PAPER-{int(time.time())}",
+                "order_id":  f"PAPER-{int(time.time())}",
                 "btc_amount": float(btc_str),
                 "usd_amount": usd_gross,
                 "price":      price,
                 "fee_usd":    fee,
+                "ordertype":  "limit-post",
                 "paper":      True,
             }
 
-        result = self._private("AddOrder", {
-            "pair":      self.pair,
-            "type":      "sell",
-            "ordertype": "limit",
-            "price":     price_str,
-            "volume":    btc_str,
-            "validate":  False,
-        })
-        order_id = result["txid"][0]
-        return {
-            "order_id":   order_id,
-            "btc_amount": float(btc_str),
-            "usd_amount": usd_gross,
-            "price":      price,
-            "fee_usd":    fee,
-            "paper":      False,
-        }
+        for attempt in range(MAX_MAKER_RETRIES):
+            best_bid, best_ask, last_price = self.get_book_top()
+            try:
+                limit_price = compute_maker_limit_price(
+                    "sell", best_bid, best_ask, last_price, retry_count=attempt
+                )
+            except ValueError as e:
+                logger.warning("[maker] sell price drift guard tripped: %s", e)
+                return False
+
+            usd_gross = float(btc_str) * limit_price
+            fee = usd_gross * self.maker_fee
+            try:
+                result = self._private("AddOrder", {
+                    "pair":      self.pair,
+                    "type":      "sell",
+                    "ordertype": "limit",
+                    "price":     f"{limit_price:.1f}",
+                    "volume":    btc_str,
+                    "oflags":    "post",
+                    "validate":  False,
+                })
+                order_id = result["txid"][0]
+                logger.info("[maker] SELL attempt %d/%d accepted txid=%s @ $%.1f "
+                            "(bid=%.1f ask=%.1f)", attempt + 1, MAX_MAKER_RETRIES,
+                            order_id, limit_price, best_bid, best_ask)
+                return {
+                    "order_id":   order_id,
+                    "btc_amount": float(btc_str),
+                    "usd_amount": usd_gross,
+                    "price":      limit_price,
+                    "fee_usd":    fee,
+                    "ordertype":  "limit-post",
+                    "paper":      False,
+                }
+            except KrakenAPIError as e:
+                if _is_post_only_rejection(e) and attempt < MAX_MAKER_RETRIES - 1:
+                    logger.info("[maker] sell post-only rejected (attempt %d/%d): "
+                                "%s — repricing", attempt + 1, MAX_MAKER_RETRIES, e)
+                    time.sleep(MAKER_POLL_INTERVAL_SECONDS)
+                    continue
+                logger.error("[maker] sell AddOrder failed permanently: %s", e)
+                return False
+        return False
 
     def get_open_orders(self) -> dict:
         """Return all open orders."""
