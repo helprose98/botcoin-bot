@@ -1325,9 +1325,19 @@ def _fetch_latest_version() -> str | None:
 
 
 def _version_gt(a: str, b: str) -> bool:
-    """Return True if version a is greater than version b."""
+    """Return True if version a is greater than version b.
+
+    Handles SemVer pre-release suffixes (e.g. '2.0.0-dev', '2.0.0-rc.1')
+    by stripping anything after a hyphen before parsing. This matches
+    PEP 440's release-segment-first ordering for our update-check use case;
+    we never need to distinguish between 2.0.0-dev and 2.0.0 for 'is there a
+    new release?' — a new MAJOR.MINOR.PATCH wins regardless of suffix.
+    """
+    def _parse(v: str) -> tuple:
+        base = v.split("-", 1)[0]  # strip pre-release suffix
+        return tuple(int(x) for x in base.split("."))
     try:
-        return tuple(int(x) for x in a.split(".")) > tuple(int(x) for x in b.split("."))
+        return _parse(a) > _parse(b)
     except Exception:
         return False
 
