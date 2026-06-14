@@ -313,6 +313,35 @@ def _run_migrations(conn) -> None:
     # 'closed', and that migration is what marks historical fills closed.
     _backfill_basis_from_ledger(conn)
 
+    # v2.0.0 — regime-transition ledger for the event-driven regime detector.
+    # Each row is one state change (chop/breakout_up/breakdown/cooling), captured
+    # at the boundary tick. CREATE IF NOT EXISTS is self-guarding, so this is safe
+    # to run on every startup; no _migrations_applied bookkeeping is needed for a
+    # pure additive table (that guard is only required for one-shot data rewrites).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS regime_transitions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp      DATETIME NOT NULL DEFAULT (datetime('now')),
+            from_regime    TEXT,
+            to_regime      TEXT NOT NULL,
+            price_usd      REAL NOT NULL,
+            atr_ratio      REAL,
+            vol_multiplier REAL
+        )
+    """)
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_regime_trans_ts
+                    ON regime_transitions(timestamp)""")
+
+    # v2.0.0 — per-position fields for the Universal Recycler. Each open position
+    # carries its own sell band (so the band is fixed at open-time and not
+    # recomputed as volatility drifts) plus the volatility reading it was opened
+    # under, and a conversion timestamp set when it ages out to a long-hold.
+    # Nullable so pre-existing range_positions rows (from the v1 Sideways overlay)
+    # remain valid and are simply treated as "no v2 metadata".
+    _ensure_column(conn, "range_positions", "sell_band_price",        "REAL")
+    _ensure_column(conn, "range_positions", "vol_multiplier_at_open", "REAL")
+    _ensure_column(conn, "range_positions", "converted_at",           "DATETIME")
+
 
 # ── Trade functions ──────────────────────────────────────────────────────────
 
@@ -569,6 +598,25 @@ def get_recent_low(hours: int = 168) -> float | None:
     return row["low"] if row and row["low"] else None
 
 
+def get_recent_average_price(hours: int = 24) -> float | None:
+    """
+    Return the mean intraday price over the last N hours.
+
+    Used as the Universal Recycler's band midpoint when RECYCLER_BAND_REFERENCE
+    is 'vwap_24h'. The price_history table samples roughly every 15 minutes
+    without volume, so this is a time-weighted mean (a true volume-weighted
+    average is not available from this table) — a stable, slow-moving reference
+    for the recycler's buy/sell bands. Returns None if no samples exist in the
+    window so the caller can fall back to the live price.
+    """
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT AVG(price_usd) as avg_price FROM price_history
+            WHERE timestamp >= datetime('now', ? || ' hours')
+        """, (f"-{hours}",)).fetchone()
+    return row["avg_price"] if row and row["avg_price"] else None
+
+
 # ── Mode switch log ───────────────────────────────────────────────────────────
 
 def record_mode_switch(from_mode, to_mode, reason, price_usd, ma200=None):
@@ -586,6 +634,40 @@ def get_mode_switch_history():
         return conn.execute(
             "SELECT * FROM mode_switches ORDER BY timestamp ASC"
         ).fetchall()
+
+
+# ── Regime transitions (v2.0 event-driven detector) ──────────────────────────
+
+def record_regime_transition(from_regime, to_regime, price_usd,
+                             atr_ratio=None, vol_multiplier=None):
+    """
+    Append one regime-state change to the regime_transitions ledger.
+
+    Called exactly once per actual transition (the regime detector returns a
+    non-None transition only at the boundary tick), so this table holds a clean
+    audit trail of every chop/breakout_up/breakdown/cooling change the bot made
+    and the market reading that triggered it. atr_ratio is the RAW
+    atr_pct/baseline_pct (unclamped) the detector keyed off — kept for audit.
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO regime_transitions
+                (from_regime, to_regime, price_usd, atr_ratio, vol_multiplier)
+            VALUES (?, ?, ?, ?, ?)
+        """, (from_regime, to_regime, price_usd, atr_ratio, vol_multiplier))
+    logger.info("[REGIME] %s → %s | price=$%.2f atr_ratio=%s",
+                from_regime, to_regime, price_usd,
+                f"{atr_ratio:.3f}" if atr_ratio is not None else "n/a")
+
+
+def get_regime_transitions(limit: int = 200) -> list[dict]:
+    """Return the most recent regime transitions, newest first (for API/audit)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM regime_transitions ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Bot state functions ───────────────────────────────────────────────────────
@@ -611,15 +693,28 @@ def get_state(key: str, default=None):
 # ── Range positions (Sideways Market) ────────────────────────────────────────
 
 def add_range_position(trade_id: int, buy_price: float,
-                       btc_amount: float, usd_amount: float):
-    """Record a new open range recycler position."""
+                       btc_amount: float, usd_amount: float,
+                       sell_band_price: float = None,
+                       vol_multiplier_at_open: float = None):
+    """
+    Record a new open range recycler position.
+
+    sell_band_price / vol_multiplier_at_open are the v2 Universal Recycler fields
+    (spec §4). They are optional with NULL defaults so the v1 Sideways overlay
+    caller keeps working unchanged; the v2 recycler always supplies them so each
+    position's sell target is pinned at open-time.
+    """
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO range_positions (trade_id, buy_price, btc_amount, usd_amount, status)
-            VALUES (?, ?, ?, ?, 'open')
-        """, (trade_id, buy_price, btc_amount, usd_amount))
-    logger.info("[RANGE] New position: %.8f BTC @ $%.2f ($%.2f)",
-                btc_amount, buy_price, usd_amount)
+            INSERT INTO range_positions
+                (trade_id, buy_price, btc_amount, usd_amount, status,
+                 sell_band_price, vol_multiplier_at_open)
+            VALUES (?, ?, ?, ?, 'open', ?, ?)
+        """, (trade_id, buy_price, btc_amount, usd_amount,
+              sell_band_price, vol_multiplier_at_open))
+    logger.info("[RANGE] New position: %.8f BTC @ $%.2f ($%.2f) sell_band=%s",
+                btc_amount, buy_price, usd_amount,
+                f"${sell_band_price:.2f}" if sell_band_price else "n/a")
 
 
 def get_open_range_positions() -> list[dict]:
@@ -650,6 +745,25 @@ def convert_range_positions():
     if count:
         logger.info("[RANGE] Converted %d open positions to normal recycler", count)
     return count
+
+
+def convert_range_position(position_id: int):
+    """
+    Convert a single open range position to 'converted' (long-hold).
+
+    The v2 Universal Recycler ages out individual positions one at a time (when
+    they exceed the time limit, or when a breakdown-held position hits its max
+    hold), rather than the v1 bulk-on-exit `convert_range_positions`. A converted
+    position is never force-sold at a loss — it joins the long-hold stack, which
+    is consistent with the prime directive. Records the conversion timestamp.
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE range_positions
+               SET status='converted', converted_at=datetime('now')
+             WHERE id=? AND status='open'
+        """, (position_id,))
+    logger.info("[RANGE] Position %d converted to long-hold", position_id)
 
 
 def count_open_range_positions() -> int:

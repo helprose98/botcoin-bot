@@ -404,6 +404,12 @@ def get_usd_avg_sell_basis() -> float:
     """
     Calculate the average price at which the bot has sold BTC for USD
     (used by USD mode recycler logic).
+
+    DEPRECATED in v2.0 — retained ONLY so the v1 strategy path (USD_ACCUMULATE
+    mode) keeps working unchanged while STRATEGY_VERSION="v1". The v2 stack never
+    calls this; the usd_spike_sell_*/usd_dca_sell mechanisms it serves are the
+    behavior v2 exists to replace. To be removed in the post-dry-run cleanup
+    commit (impl spec §9, step 12), once production has moved to v2.
     """
     from database import get_all_trades
     trades = get_all_trades()
@@ -416,3 +422,110 @@ def get_usd_avg_sell_basis() -> float:
     total_btc = sum(t["btc_amount"] for t in sell_trades)
     total_usd = sum(t["usd_amount"] for t in sell_trades)
     return total_usd / total_btc if total_btc > 0 else 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY v2.0 — regime-driven orchestrator
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# v2 keeps the proven BTC-accumulation building blocks (DCA, dip buys) and bolts
+# on three new always-on systems — the event-driven regime detector, the
+# Universal Recycler, and Harvest — replacing the v1 USD-accumulation drain
+# (usd_spike_sell_*, usd_dca_sell, usd_recycler_*). Those v1 functions are NOT
+# deleted here because the v1 path must remain runnable while STRATEGY_VERSION is
+# "v1"; the v2 orchestrator simply never calls them. They are scheduled for
+# removal in the post-dry-run cleanup commit (impl spec §9, step 12).
+#
+# The orchestrator is a pure planner: it returns an ORDERED list of action dicts
+# and places no orders itself. main.py routes each action through the global
+# throttle and the shared execute_buy/execute_sell path, exactly as the v1
+# dispatch does, so the anti-thrash dampener still governs every v2 trade.
+
+
+def v2_plan_actions(cfg: Config, current_price: float, ma200,
+                    btc_balance: float, usd_balance: float,
+                    avg_cost_basis: float, atr_ratio: float,
+                    regime: str, operating_regime: str) -> list[dict]:
+    """
+    Build the ordered list of trading actions for one v2 tick.
+
+    Priority order (first action that the throttle admits typically fires;
+    main.py decides how many to attempt):
+      1. Harvest   — only in the HARVEST operating regime; the sole net-seller,
+                     hard-capped, never fires in Accumulate/Neutral.
+      2. Recycler  — always-on cycling (open/close/convert), regime-aware.
+      3. Dip buy   — opportunistic accumulation; suppressed during a breakdown
+                     so the bot does not buy into a confirmed knife.
+      4. DCA       — scheduled stacking; runs in every operating regime, but the
+                     amount is scaled down (DCA_HARVEST_SCALE) during Harvest.
+
+    Parameters mirror the data main.py already computes each tick. atr_ratio is
+    the RAW atr_pct/baseline_pct (NOT the clamped vol_multiplier) so the recycler
+    bands reach the Storm bucket — see Q-new-4 in the impl spec.
+    """
+    # Imported here (not at module top) to keep the v1 strategy library free of
+    # any hard dependency on the v2 modules: a v1-only deployment never imports
+    # them, and there is no circular-import risk at load time.
+    from mode_manager import OperatingRegime
+    import universal_recycler
+    import harvest
+    from regime_detector import REGIME_BREAKDOWN
+
+    actions: list[dict] = []
+
+    # 1. Harvest (HARVEST regime only).
+    if operating_regime == OperatingRegime.HARVEST.value:
+        harvest_action = harvest.evaluate(
+            cfg, current_price, ma200, btc_balance, avg_cost_basis, regime)
+        if harvest_action:
+            actions.append(harvest_action)
+
+    # 2. Universal Recycler (always-on; internally regime-aware).
+    actions.extend(universal_recycler.evaluate(
+        cfg, current_price, btc_balance, usd_balance, atr_ratio, regime))
+
+    # 3. Dip buy — accumulation, but never into a confirmed breakdown.
+    if regime != REGIME_BREAKDOWN:
+        dip_action = btc_check_dip_buy(cfg, current_price, usd_balance, _atr_to_vol_mult(cfg, atr_ratio))
+        if dip_action:
+            actions.append(dip_action)
+
+    # 4. Scheduled DCA — runs in every regime; amount scaled during Harvest.
+    dca_action = _v2_dca_action(cfg, usd_balance, operating_regime)
+    if dca_action:
+        actions.append(dca_action)
+
+    return actions
+
+
+def _atr_to_vol_mult(cfg: Config, atr_ratio: float) -> float:
+    """
+    Re-clamp the raw ATR ratio into the configured vol-multiplier band for the
+    dip-buy threshold scaling, matching what calculate_atr would have returned.
+    The recycler uses the raw ratio, but dip-buy thresholds expect the clamped
+    multiplier, so we clamp here rather than threading two values through.
+    """
+    if not atr_ratio or atr_ratio <= 0:
+        return 1.0
+    return max(cfg.vol_multiplier_min, min(cfg.vol_multiplier_max, atr_ratio))
+
+
+def _v2_dca_action(cfg: Config, usd_balance: float,
+                   operating_regime: str) -> dict | None:
+    """
+    Scheduled DCA for v2. Reuses btc_check_dca's window/due logic, then scales
+    the amount down by DCA_HARVEST_SCALE while harvesting (we lighten new buying
+    when we're also taking profit), leaving it untouched otherwise.
+    """
+    from mode_manager import OperatingRegime
+    action = btc_check_dca(cfg, usd_balance)
+    if not action:
+        return None
+    if operating_regime == OperatingRegime.HARVEST.value:
+        scaled = action["usd_amount"] * cfg.dca_harvest_scale
+        if scaled < cfg.min_order_usd:
+            logger.debug("[v2 DCA] scaled amount $%.2f below min order — skipping", scaled)
+            return None
+        action["usd_amount"] = scaled
+        logger.info("[v2 DCA] Harvest regime — DCA scaled to $%.2f", scaled)
+    return action
