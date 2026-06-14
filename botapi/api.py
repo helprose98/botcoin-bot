@@ -1149,7 +1149,48 @@ def save_settings():
         # Anti-thrash dampener (v1.5.0)
         "MIN_GAP_BETWEEN_TRADES_SECONDS":  body.get("min_gap_between_trades_seconds"),
         "MAX_TRADES_PER_DAY":              body.get("max_trades_per_day"),
+        # ── Strategy v2.0 keys (dormant on v1; active when STRATEGY_VERSION=v2) ──
+        # These come from two places in the dashboard: (1) the aggression dial,
+        # which writes the five size knobs as a preset bundle; (2) the expert
+        # drawer, which lets the operator tune any of the 22 v2 keys directly.
+        # All keys are accepted on a v1.5.2 bot too — they simply sit in .env
+        # unused until the operator flips STRATEGY_VERSION to v2.
+        "STRATEGY_VERSION":                body.get("strategy_version"),
+        "HARVEST_THRESHOLD_PCT":           body.get("harvest_threshold_pct"),
+        "HARVEST_EXIT_PCT":                body.get("harvest_exit_pct"),
+        "HARVEST_SUSTAIN_DAYS":            body.get("harvest_sustain_days"),
+        "HARVEST_FIRE_CAP_PCT":            body.get("harvest_fire_cap_pct"),
+        "HARVEST_TOTAL_CAP_PCT":           body.get("harvest_total_cap_pct"),
+        "HARVEST_TIER_TRIGGER_PCT":        body.get("harvest_tier_trigger_pct"),
+        "HARVEST_MIN_STACK_BTC":           body.get("harvest_min_stack_btc"),
+        "RECYCLER_POSITION_CAP_USD":       body.get("recycler_position_cap_usd"),
+        "RECYCLER_POSITION_PCT":           body.get("recycler_position_pct"),
+        "RECYCLER_MIN_POSITIONS":          body.get("recycler_min_positions"),
+        "RECYCLER_POSITION_DIVISOR":       body.get("recycler_position_divisor"),
+        "RECYCLER_TIME_LIMIT_DAYS":        body.get("recycler_time_limit_days"),
+        "RECYCLER_BAND_REFERENCE":         body.get("recycler_band_reference"),
+        "BREAKOUT_ATR_MULTIPLIER":         body.get("breakout_atr_multiplier"),
+        "BREAKDOWN_ATR_MULTIPLIER":        body.get("breakdown_atr_multiplier"),
+        "REGIME_BREAK_LOOKBACK_DAYS":      body.get("regime_break_lookback_days"),
+        "REGIME_COOLING_QUIET_HOURS":      body.get("regime_cooling_quiet_hours"),
+        "BREAKDOWN_MAX_HOLD_DAYS":         body.get("breakdown_max_hold_days"),
+        "DCA_HARVEST_SCALE":               body.get("dca_harvest_scale"),
+        "REBUILD_DCA_AMOUNT_USD":          body.get("rebuild_dca_amount_usd"),
+        "REBUILD_DCA_DAYS":                body.get("rebuild_dca_days"),
     }
+    # STRATEGY_VERSION: validate before accepting (only "v1" or "v2").
+    if allowed.get("STRATEGY_VERSION") is not None:
+        sv = str(allowed["STRATEGY_VERSION"]).lower().strip()
+        if sv not in ("v1", "v2"):
+            return jsonify({"ok": False, "error": "strategy_version must be 'v1' or 'v2'"}), 400
+        allowed["STRATEGY_VERSION"] = sv
+    # RECYCLER_BAND_REFERENCE: validate before accepting.
+    if allowed.get("RECYCLER_BAND_REFERENCE") is not None:
+        rbr = str(allowed["RECYCLER_BAND_REFERENCE"]).lower().strip()
+        if rbr not in ("vwap_24h", "mid_recent_hl", "last_close"):
+            return jsonify({"ok": False,
+                            "error": "recycler_band_reference must be one of vwap_24h, mid_recent_hl, last_close"}), 400
+        allowed["RECYCLER_BAND_REFERENCE"] = rbr
     # Volatility-adaptive toggle is boolean-only: normalise truthy/falsy input.
     if body.get("volatility_adaptive_enabled") is not None:
         v = body.get("volatility_adaptive_enabled")
