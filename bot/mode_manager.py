@@ -31,6 +31,56 @@ class Mode(str, Enum):
     AUTO           = "auto"
 
 
+class OperatingRegime(str, Enum):
+    """
+    Strategy v2.0 operating regime, classified purely by where price sits
+    relative to the 200-day moving average. Unlike the v1 AUTO Mode this is NOT
+    a sticky switch with hysteresis — it is a continuous band classification.
+    Whipsaw protection lives downstream (Harvest's sustain timer and the event
+    driven regime detector), not here.
+
+      ACCUMULATE  price below 200MA × harvest_exit_pct       → keep stacking
+      NEUTRAL     between exit and harvest_threshold          → cycle, no harvest
+      HARVEST     at/above 200MA × harvest_threshold_pct      → harvesting allowed
+    """
+    ACCUMULATE = "accumulate"
+    NEUTRAL    = "neutral"
+    HARVEST    = "harvest"
+
+
+def get_operating_regime(cfg, current_price: float) -> OperatingRegime:
+    """
+    Classify the v2 operating regime from price vs the 200MA.
+
+    Falls back to ACCUMULATE when the 200MA is not yet available (insufficient
+    history) — the conservative, prime-directive-aligned default of "keep
+    stacking until we can prove we're in a rally".
+    """
+    ma200 = calculate_200ma()
+    if ma200 is None or ma200 <= 0:
+        return OperatingRegime.ACCUMULATE
+
+    ratio = current_price / ma200
+    if ratio >= cfg.harvest_threshold_pct:
+        return OperatingRegime.HARVEST
+    if ratio >= cfg.harvest_exit_pct:
+        return OperatingRegime.NEUTRAL
+    return OperatingRegime.ACCUMULATE
+
+
+def get_operating_regime_status(cfg, current_price: float) -> dict:
+    """Return the v2 operating-regime classification for /api/status."""
+    ma200 = calculate_200ma()
+    regime = get_operating_regime(cfg, current_price)
+    ratio = (current_price / ma200) if (ma200 and ma200 > 0) else None
+    return {
+        "operating_regime": regime.value,
+        "price_200ma":      round(ma200, 2) if ma200 else None,
+        "ma_ratio":         round(ratio, 4) if ratio is not None else None,
+        "ma_available":     ma200 is not None,
+    }
+
+
 # How far above/below the 200MA price must be before auto mode switches.
 # Prevents rapid flip-flopping when price hovers around the MA.
 # 0.05 = price must be 5% above MA to confirm bull, 5% below to confirm bear.

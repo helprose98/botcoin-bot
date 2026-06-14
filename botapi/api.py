@@ -519,6 +519,10 @@ def _format_trade(t):
         "usd_recycler_resell":  "Recycler Resell (selling bounce)",
         "range_recycler_buy":   "Range Recycler Buy (sideways dip)",
         "range_recycler_sell":  "Range Recycler Sell (sideways pop)",
+        # Strategy v2.0 reasons.
+        "universal_recycler_open":  "Recycler Open (bought a slice)",
+        "universal_recycler_close": "Recycler Close (sold a slice for profit)",
+        "harvest_fire":             "Harvest (took profit on confirmed rally)",
         "onboarding":           "Onboarding (existing position)",
         "quick_buy":            "Quick Buy BTC (manual)",
     }
@@ -668,6 +672,110 @@ def _get_volatility_status():
         "multiplier":   round(multiplier, 3),
         "regime":       regime,
     }
+
+
+def _get_strategy_version() -> str:
+    """Return the configured strategy engine ("v1" or "v2").
+
+    Read from .env so the dashboard can degrade gracefully against a v1.x bot
+    that has no v2 keys at all (defaults to "v1").
+    """
+    env = _read_env()
+    return env.get("STRATEGY_VERSION", "v1").lower().strip()
+
+
+def _get_regime_status() -> dict:
+    """Build the v2 event-driven regime block from bot_state (additive, v2-only).
+
+    Reads the keys regime_detector.py persists; returns a chop/cold-start default
+    when those keys are absent (i.e. the bot is still on v1.x).
+    """
+    return {
+        "state":      _state("regime_current", "chop"),
+        "entered_at": _state("regime_entered_ts"),
+    }
+
+
+def _get_harvest_status() -> dict:
+    """Build the v2 Harvest block from bot_state (additive, v2-only).
+
+    Mirrors harvest.get_harvest_status using only bot_state reads so the API has
+    no hard dependency on the bot package. All fields fall back to inert
+    defaults when the bot is on v1.x and has never written them.
+    """
+    def _f(key, default=0.0):
+        raw = _state(key, "")
+        try:
+            return float(raw) if raw not in (None, "") else default
+        except (TypeError, ValueError):
+            return default
+
+    env = _read_env()
+    total_cap_pct = float(env.get("HARVEST_TOTAL_CAP_PCT", "0.33"))
+    start_stack   = _f("harvest_rally_start_stack")
+    sold          = _f("harvest_rally_sold_btc")
+    rally_cap_btc = start_stack * total_cap_pct
+    return {
+        "active":            _state("harvest_rally_active", "false") == "true",
+        "rally_sold_btc":    round(sold, 8),
+        "rally_cap_btc":     round(rally_cap_btc, 8),
+        "cap_remaining_btc": round(max(0.0, rally_cap_btc - sold), 8),
+        "threshold_pct":     float(env.get("HARVEST_THRESHOLD_PCT", "1.15")),
+    }
+
+
+def _get_operating_regime_status(current_price, ma200) -> dict:
+    """Classify the v2 operating regime (Accumulate / Neutral / Harvest) for the
+    dashboard, mirroring mode_manager.get_operating_regime without importing the
+    bot package.
+
+    Pure function of price vs the 200MA and the configured harvest bands. Falls
+    back to "accumulate" with ma_available=False when the 200MA is not yet built
+    (insufficient history) or the bot is on v1.x — the conservative,
+    prime-directive-aligned default of "keep stacking until a rally is proven".
+    """
+    env = _read_env()
+    try:
+        threshold = float(env.get("HARVEST_THRESHOLD_PCT", "1.15"))
+        exit_pct  = float(env.get("HARVEST_EXIT_PCT", "1.05"))
+    except (TypeError, ValueError):
+        threshold, exit_pct = 1.15, 1.05
+
+    if not ma200 or ma200 <= 0 or not current_price:
+        return {"operating_regime": "accumulate", "ma_ratio": None,
+                "ma_available": False}
+
+    ratio = current_price / ma200
+    if ratio >= threshold:
+        regime = "harvest"
+    elif ratio >= exit_pct:
+        regime = "neutral"
+    else:
+        regime = "accumulate"
+    return {"operating_regime": regime, "ma_ratio": round(ratio, 4),
+            "ma_available": True}
+
+
+def _get_recycler_positions() -> list:
+    """Return open v2 Universal Recycler positions for /api/status (additive).
+
+    Empty list when the table has no open rows (including on a v1.x bot).
+    """
+    rows = query(
+        "SELECT id, buy_price, btc_amount, sell_band_price, timestamp "
+        "FROM range_positions WHERE status='open' ORDER BY timestamp ASC"
+    )
+    out = []
+    for r in rows:
+        out.append({
+            "id":              r["id"],
+            "buy_price":       round(r["buy_price"], 2) if r["buy_price"] else None,
+            "btc_amount":      round(r["btc_amount"], 8) if r["btc_amount"] else None,
+            "sell_band_price": round(r["sell_band_price"], 2)
+                               if ("sell_band_price" in r.keys() and r["sell_band_price"]) else None,
+            "opened_at":       r["timestamp"],
+        })
+    return out
 
 
 def _btc_stack_history():
@@ -820,6 +928,13 @@ def status():
             "sideways":        _get_sideways_status(),
             "throttle":        _get_throttle_status(),
             "volatility":      _get_volatility_status(),
+            # ── Strategy v2.0 additive fields (inert defaults on a v1.x bot). ──
+            "strategy_version":   _get_strategy_version(),
+            "regime_state":       _get_regime_status()["state"],
+            "regime_substate":    _get_regime_status()["entered_at"],
+            "operating_regime":   _get_operating_regime_status(current_price, ma200),
+            "harvest_state":      _get_harvest_status(),
+            "recycler_positions": _get_recycler_positions(),
         },
         "version":    _read_local_version(),
         "mood":       mood,

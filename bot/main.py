@@ -108,13 +108,16 @@ from database import (
     init_db, record_trade, save_portfolio_snapshot,
     get_latest_snapshot, record_price, record_daily_price, get_summary,
     record_mode_switch, get_last_trade_by_reason,
-    add_range_position, close_range_position,
+    add_range_position, close_range_position, convert_range_position,
     get_unreconciled_trades, update_trade_fill, set_state,
     get_avg_cost_basis_from_ledger, update_snapshot_basis,
 )
 from kraken_client import KrakenClient, KrakenAPIError
 from onboarding import run_onboarding
-from mode_manager import Mode, get_active_mode, get_mode_status
+from mode_manager import (
+    Mode, get_active_mode, get_mode_status,
+    get_operating_regime, calculate_200ma,
+)
 from strategies import (
     # BTC accumulate
     btc_check_dca, btc_check_dip_buy,
@@ -123,9 +126,12 @@ from strategies import (
     usd_check_spike_sell,
     usd_check_recycler_buy, usd_check_recycler_resell,
     get_usd_avg_sell_basis,
+    # v2 orchestrator
+    v2_plan_actions,
 )
 from sideways import check_sideways
 from volatility import calculate_atr
+import regime_detector
 import throttle
 
 LOOP_INTERVAL_SECONDS  = 300   # Check every 5 minutes
@@ -320,6 +326,96 @@ def run_range_recycler(client, current_price, snapshot, active_mode):
                     btc_amount=action["btc_amount"],
                     usd_amount=usd_amount,
                 )
+
+
+# ── Strategy v2.0 execution ────────────────────────────────────────────────────
+
+def run_v2_strategies(client, current_price, snapshot, active_mode,
+                      atr_pct, atr_baseline_pct, vol_multiplier):
+    """Execute one Strategy v2.0 tick: regime detection + planned actions.
+
+    Mirrors the v1 dispatch contract — every order still flows through the global
+    throttle and the shared execute_buy/execute_sell path, so the anti-thrash
+    dampener governs v2 trades exactly as it does v1 ones. This function owns the
+    v2 bookkeeping the planners cannot: it persists the regime transition event,
+    snapshots range_positions on recycler opens/closes, and applies long-hold
+    conversions (which place no order).
+
+    The regime detector runs on EVERY tick (a transition is emitted at most once,
+    at the boundary). The planners receive the RAW atr_pct/baseline_pct ratio
+    (NOT the clamped vol_multiplier) so the recycler can reach the Storm band and
+    the detector can see a >2× baseline break — see Q-new-4 in the impl spec.
+    """
+    # ── Regime detection (event-driven; persists on transition only). ──────────
+    new_regime, transition = regime_detector.evaluate(
+        cfg, current_price, atr_pct, atr_baseline_pct, vol_multiplier)
+    if transition:
+        regime_detector.commit_transition(transition)
+        logger.info("[v2] REGIME %s → %s @ $%.2f (atr_ratio=%s)",
+                    transition["from_regime"], transition["to_regime"],
+                    current_price, transition["atr_ratio"])
+
+    # Raw ATR ratio for the recycler bands / harvest gate (degrades to 1.0).
+    if atr_pct and atr_baseline_pct and atr_baseline_pct > 0:
+        atr_ratio = atr_pct / atr_baseline_pct
+    else:
+        atr_ratio = 1.0
+
+    # ── Live balances — never trust a stale snapshot (matches v1). ─────────────
+    try:
+        live_balances = client.get_balance()
+        btc_balance = live_balances["BTC"]
+        usd_balance = live_balances["USD"]
+        logger.debug("Live balances: BTC=%.8f USD=$%.2f", btc_balance, usd_balance)
+    except Exception as e:
+        logger.warning("Could not fetch live balance, falling back to snapshot: %s", e)
+        btc_balance = snapshot["btc_balance"] if snapshot else 0.0
+        usd_balance = snapshot["usd_balance"] if snapshot else 0.0
+    avg_cost_basis = snapshot["avg_cost_basis"] if snapshot else 0.0
+
+    ma200 = calculate_200ma()
+    operating_regime = get_operating_regime(cfg, current_price).value
+
+    actions = v2_plan_actions(
+        cfg, current_price, ma200, btc_balance, usd_balance,
+        avg_cost_basis, atr_ratio, new_regime, operating_regime)
+
+    for action in actions:
+        # ── Conversions place no order — they are pure DB long-hold reclassings.
+        if action["type"] == "convert":
+            convert_range_position(action["position_id"])
+            logger.info("[v2] converted range position %d to long-hold (%s)",
+                        action["position_id"], action.get("reason", ""))
+            continue
+
+        allowed, msg = throttle.check_throttle(action["reason"], cfg)
+        if not allowed:
+            logger.info("[throttle] skipping %s: %s", action["reason"], msg)
+            continue
+
+        if action["type"] == "buy":
+            ok = execute_buy(client, current_price, action["usd_amount"],
+                             action["reason"], active_mode, snapshot)
+            if ok and action["reason"] == "universal_recycler_open":
+                # Open a new recycler position carrying its own pinned sell band.
+                btc_bought = action["usd_amount"] / current_price
+                trade_row = get_last_trade_by_reason(action["reason"])
+                trade_id = trade_row["id"] if trade_row else None
+                add_range_position(
+                    trade_id=trade_id,
+                    buy_price=current_price,
+                    btc_amount=btc_bought,
+                    usd_amount=action["usd_amount"],
+                    sell_band_price=action.get("sell_band_price"),
+                    vol_multiplier_at_open=action.get("vol_multiplier"),
+                )
+
+        elif action["type"] == "sell":
+            ok = execute_sell(client, current_price, action["btc_amount"],
+                              action["reason"], active_mode, snapshot)
+            if ok and "position_id" in action:
+                # Closing a recycler position (sold its slice at/above its band).
+                close_range_position(action["position_id"])
 
 
 # ── Strategy dispatch ─────────────────────────────────────────────────────────
@@ -655,16 +751,23 @@ def main():
             snapshot = get_latest_snapshot()
 
             # ── Dispatch to correct strategy set ─────────────────────────────
-            if active_mode == Mode.BTC_ACCUMULATE:
-                run_btc_accumulate_strategies(client, current_price, snapshot,
-                                              active_mode, vol_multiplier)
-            elif active_mode == Mode.USD_ACCUMULATE:
-                run_usd_accumulate_strategies(client, current_price, snapshot,
-                                              active_mode, vol_multiplier)
-            # AUTO mode is resolved to BTC or USD above — never reaches here as AUTO
+            # STRATEGY_VERSION selects the engine. v1 is the unchanged legacy
+            # path (BTC/USD accumulate + the Sideways Range Recycler overlay).
+            # v2 is the always-on Universal Recycler + Harvest + regime detector.
+            if cfg.strategy_version == "v2":
+                run_v2_strategies(client, current_price, snapshot, active_mode,
+                                  atr_pct, atr_baseline_pct, vol_multiplier)
+            else:
+                if active_mode == Mode.BTC_ACCUMULATE:
+                    run_btc_accumulate_strategies(client, current_price, snapshot,
+                                                  active_mode, vol_multiplier)
+                elif active_mode == Mode.USD_ACCUMULATE:
+                    run_usd_accumulate_strategies(client, current_price, snapshot,
+                                                  active_mode, vol_multiplier)
+                # AUTO mode is resolved to BTC or USD above — never reaches here.
 
-            # ── Sideways Market overlay (Range Recycler) ─────────────────────
-            run_range_recycler(client, current_price, snapshot, active_mode)
+                # ── Sideways Market overlay (Range Recycler) ─────────────────
+                run_range_recycler(client, current_price, snapshot, active_mode)
 
             consecutive_errors = 0
 
