@@ -1,8 +1,8 @@
 """
 universal_recycler.py — Always-on, volatility-adaptive Range Recycler (v2.0).
 
-This generalizes the v1 Sideways overlay (sideways.py): there is no 12%-range
-activation gate and no on/off detection. The recycler runs every tick, buying
+There is no 12%-range activation gate and no on/off detection: the recycler
+generalizes range-trading into an always-on system. It runs every tick, buying
 small slices below a moving reference and selling each slice for a small profit
 above its own entry. Bands widen with volatility so the recycler trades less
 frequently (and pays fewer fees) in storms and more often when calm.
@@ -27,7 +27,7 @@ Regime awareness (from regime_detector)
 This module is pure decision logic: it returns a list of action dicts. main.py's
 v2 orchestrator routes every action through the global throttle and the shared
 execute_buy/execute_sell path, then updates range_positions. Keeping execution
-out of here mirrors how check_sideways feeds run_range_recycler in v1.
+out of here keeps this module pure decision logic.
 
 Prime directive: net-accumulate sats from chop without ever net-distributing the
 stack.

@@ -1,5 +1,11 @@
 # BotCoin Changelog
 
+## v2.1.0 — 2026-06-14 — v1 strategy removed
+- STRATEGY_VERSION env var deleted; v2 is the only execution path
+- Removed v1 USD-mode functions: usd_spike_sell_tier{1,2,3}, usd_dca_sell, usd_recycler_buy, usd_recycler_resell
+- Removed v1/v2 selector validation from /api/settings
+- Historical trade reason labels retained for DB backward compatibility
+
 ## v1.5.2 — 2026-06-13
 - Fix cost-basis drift: avg_cost_basis is now computed from the confirmed-buy
   ledger at fill-confirmation time (in the reconciler), not from a live balance

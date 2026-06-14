@@ -97,12 +97,6 @@ class Config:
     max_trades_per_day:             int
 
     # ── Strategy v2.0 ──────────────────────────────────────────────────────────
-    # Runtime strategy selector. "v1" runs the legacy BTC/USD accumulation stack
-    # (unchanged); "v2" runs the regime-driven Universal Recycler + Harvest stack.
-    # Defaults to "v1" so upgrading the code never silently changes trading
-    # behavior — the operator opts into v2 explicitly.
-    strategy_version: str
-
     # Harvest mode — the ONLY net stack-reduction path in v2. Gated on a confirmed
     # rally (price sustained above 200MA × threshold) and hard-capped per fire and
     # per rally so it can never repeat the v1.x stack drain.
@@ -174,9 +168,6 @@ _ENV_DEFAULTS = {
     "MIN_GAP_BETWEEN_TRADES_SECONDS": "3600",
     "MAX_TRADES_PER_DAY":             "8",
     # ── Strategy v2.0 (defaults from the locked-decisions table, 2026-06-13) ──
-    # STRATEGY_VERSION ships "v1": existing bots keep their exact behavior after
-    # an upgrade and only move to v2 when the operator flips this key.
-    "STRATEGY_VERSION":               "v1",
     "HARVEST_THRESHOLD_PCT":          "1.15",
     "HARVEST_EXIT_PCT":               "1.05",
     "HARVEST_SUSTAIN_DAYS":           "3",
@@ -204,9 +195,6 @@ _ENV_DEFAULTS = {
 
 # Accepted band-reference sources for the Universal Recycler (Q-new-1).
 _RECYCLER_BAND_REFERENCES = ("vwap_24h", "mid_recent_hl", "last_close")
-
-# Accepted strategy stacks.
-_STRATEGY_VERSIONS = ("v1", "v2")
 
 
 def _sync_env_defaults(env_path: str = "/app/.env"):
@@ -292,8 +280,6 @@ def load_config() -> Config:
         min_gap_between_trades_seconds = _int("MIN_GAP_BETWEEN_TRADES_SECONDS", 3600),
         max_trades_per_day             = _int("MAX_TRADES_PER_DAY", 8),
 
-        strategy_version = _get("STRATEGY_VERSION", "v1").lower().strip(),
-
         harvest_threshold_pct    = _float("HARVEST_THRESHOLD_PCT", 1.15),
         harvest_exit_pct         = _float("HARVEST_EXIT_PCT", 1.05),
         harvest_sustain_days     = _int("HARVEST_SUSTAIN_DAYS", 3),
@@ -343,10 +329,6 @@ def load_config() -> Config:
         raise ValueError("MAX_TRADES_PER_DAY must be >= 1")
 
     # ── Strategy v2.0 validation (spec §5) ─────────────────────────────────────
-    if cfg.strategy_version not in _STRATEGY_VERSIONS:
-        raise ValueError(
-            f"Invalid STRATEGY_VERSION: {cfg.strategy_version}. "
-            f"Must be one of {_STRATEGY_VERSIONS}")
     # Harvest gate must sit strictly above the exit, and both strictly above the
     # 200MA (ratio > 1.0), or Harvest would fire at or below trend.
     if not 1.0 < cfg.harvest_exit_pct < cfg.harvest_threshold_pct:
@@ -393,7 +375,6 @@ def load_config() -> Config:
     if cfg.rebuild_dca_days < 0:
         raise ValueError("REBUILD_DCA_DAYS must be >= 0")
 
-    logger.info("Config loaded — DCA: $%.2f/%s @ %s UTC | strategy=%s",
-                cfg.dca_amount_usd, cfg.dca_frequency, cfg.dca_time_utc,
-                cfg.strategy_version)
+    logger.info("Config loaded — DCA: $%.2f/%s @ %s UTC",
+                cfg.dca_amount_usd, cfg.dca_frequency, cfg.dca_time_utc)
     return cfg

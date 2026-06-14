@@ -118,18 +118,7 @@ from mode_manager import (
     Mode, get_active_mode, get_mode_status,
     get_operating_regime, calculate_200ma,
 )
-from strategies import (
-    # BTC accumulate
-    btc_check_dca, btc_check_dip_buy,
-    btc_check_recycler_sell, btc_check_recycler_rebuy,
-    # USD accumulate
-    usd_check_spike_sell,
-    usd_check_recycler_buy, usd_check_recycler_resell,
-    get_usd_avg_sell_basis,
-    # v2 orchestrator
-    v2_plan_actions,
-)
-from sideways import check_sideways
+from strategies import v2_plan_actions
 from volatility import calculate_atr
 import regime_detector
 import throttle
@@ -275,59 +264,6 @@ def execute_sell(client: KrakenClient, current_price: float, btc_amount: float,
         return False
 
 
-# ── Range Recycler execution ──────────────────────────────────────────────────
-
-def run_range_recycler(client, current_price, snapshot, active_mode):
-    """Execute Range Recycler actions from the sideways overlay.
-
-    Sideways trades are subject to the global throttle: they can otherwise stack
-    on top of a BTC/USD strategy trade in the same tick, which is exactly the
-    cross-strategy thrash the dampener exists to prevent.
-    """
-    actions = check_sideways(cfg, current_price, active_mode)
-
-    for action in actions:
-        allowed, msg = throttle.check_throttle(action["reason"], cfg)
-        if not allowed:
-            logger.info("[throttle] skipping %s: %s", action["reason"], msg)
-            continue
-        if action["type"] == "buy":
-            ok = execute_buy(client, current_price, action["usd_amount"],
-                             action["reason"], active_mode, snapshot)
-            if ok and "position_id" in action:
-                # Closing a USD-mode position (bought back cheaper)
-                close_range_position(action["position_id"])
-            elif ok:
-                # Opening a new BTC-mode position
-                btc_bought = action["usd_amount"] / current_price
-                trade_row = get_last_trade_by_reason("range_recycler_buy")
-                trade_id = trade_row["id"] if trade_row else None
-                add_range_position(
-                    trade_id=trade_id,
-                    buy_price=current_price,
-                    btc_amount=btc_bought,
-                    usd_amount=action["usd_amount"],
-                )
-
-        elif action["type"] == "sell":
-            ok = execute_sell(client, current_price, action["btc_amount"],
-                              action["reason"], active_mode, snapshot)
-            if ok and "position_id" in action:
-                # Closing a BTC-mode position (sold at profit)
-                close_range_position(action["position_id"])
-            elif ok:
-                # Opening a new USD-mode position (sold, will buy back cheaper)
-                usd_amount = action["btc_amount"] * current_price
-                trade_row = get_last_trade_by_reason("range_recycler_sell")
-                trade_id = trade_row["id"] if trade_row else None
-                add_range_position(
-                    trade_id=trade_id,
-                    buy_price=current_price,
-                    btc_amount=action["btc_amount"],
-                    usd_amount=usd_amount,
-                )
-
-
 # ── Strategy v2.0 execution ────────────────────────────────────────────────────
 
 def run_v2_strategies(client, current_price, snapshot, active_mode,
@@ -416,106 +352,6 @@ def run_v2_strategies(client, current_price, snapshot, active_mode,
             if ok and "position_id" in action:
                 # Closing a recycler position (sold its slice at/above its band).
                 close_range_position(action["position_id"])
-
-
-# ── Strategy dispatch ─────────────────────────────────────────────────────────
-
-def _dispatch_buy(client, current_price, action, active_mode, snapshot):
-    """Apply the global throttle, then place a buy. Returns True if a trade fired."""
-    allowed, msg = throttle.check_throttle(action["reason"], cfg)
-    if not allowed:
-        logger.info("[throttle] skipping %s: %s", action["reason"], msg)
-        return False
-    return execute_buy(client, current_price, action["usd_amount"],
-                       action["reason"], active_mode, snapshot)
-
-
-def _dispatch_sell(client, current_price, action, active_mode, snapshot):
-    """Apply the global throttle, then place a sell. Returns True if a trade fired."""
-    allowed, msg = throttle.check_throttle(action["reason"], cfg)
-    if not allowed:
-        logger.info("[throttle] skipping %s: %s", action["reason"], msg)
-        return False
-    return execute_sell(client, current_price, action["btc_amount"],
-                        action["reason"], active_mode, snapshot)
-
-
-def run_btc_accumulate_strategies(client, current_price, snapshot, active_mode,
-                                  vol_multiplier=1.0):
-    """Run all BTC accumulation strategy checks in priority order."""
-    # Always fetch live balances from Kraken — never trust stale snapshot values.
-    # The snapshot can lag after failed orders (e.g. EOrder:Insufficient funds)
-    # causing the bot to repeatedly attempt orders it can't afford.
-    try:
-        live_balances = client.get_balance()
-        btc_balance = live_balances["BTC"]
-        usd_balance = live_balances["USD"]
-        logger.debug("Live balances: BTC=%.8f USD=$%.2f", btc_balance, usd_balance)
-    except Exception as e:
-        logger.warning("Could not fetch live balance, falling back to snapshot: %s", e)
-        btc_balance = snapshot["btc_balance"]    if snapshot else 0.0
-        usd_balance = snapshot["usd_balance"]    if snapshot else 0.0
-    avg_cost    = snapshot["avg_cost_basis"] if snapshot else 0.0
-
-    # Priority 1: Recycler rebuy (cash is sitting waiting, deploy it)
-    action = btc_check_recycler_rebuy(cfg, current_price, usd_balance)
-    if action:
-        return _dispatch_buy(client, current_price, action, active_mode, snapshot)
-
-    # Priority 2: Recycler sell (take partial profit, reload reserve)
-    action = btc_check_recycler_sell(cfg, current_price, btc_balance, avg_cost)
-    if action:
-        return _dispatch_sell(client, current_price, action, active_mode, snapshot)
-
-    # Priority 3: Dip buy (deploy reserve on significant drop)
-    action = btc_check_dip_buy(cfg, current_price, usd_balance, vol_multiplier)
-    if action:
-        return _dispatch_buy(client, current_price, action, active_mode, snapshot)
-
-    # Priority 4: Scheduled DCA
-    action = btc_check_dca(cfg, usd_balance)
-    if action:
-        return _dispatch_buy(client, current_price, action, active_mode, snapshot)
-
-    return False
-
-
-def run_usd_accumulate_strategies(client, current_price, snapshot, active_mode,
-                                  vol_multiplier=1.0):
-    """Run all USD accumulation strategy checks in priority order (inverted)."""
-    # Same as BTC mode — always use live Kraken balances, not stale snapshot
-    try:
-        live_balances = client.get_balance()
-        btc_balance = live_balances["BTC"]
-        usd_balance = live_balances["USD"]
-        logger.debug("Live balances: BTC=%.8f USD=$%.2f", btc_balance, usd_balance)
-    except Exception as e:
-        logger.warning("Could not fetch live balance, falling back to snapshot: %s", e)
-        btc_balance = snapshot["btc_balance"] if snapshot else 0.0
-        usd_balance = snapshot["usd_balance"] if snapshot else 0.0
-    avg_sell_basis = get_usd_avg_sell_basis()
-
-    # Priority 1: Recycler resell (BTC is waiting to be resold at bounce)
-    action = usd_check_recycler_resell(cfg, current_price, btc_balance)
-    if action:
-        return _dispatch_sell(client, current_price, action, active_mode, snapshot)
-
-    # Priority 2: Recycler buy (buy cheap BTC to resell higher for more USD)
-    action = usd_check_recycler_buy(cfg, current_price, usd_balance, avg_sell_basis)
-    if action:
-        return _dispatch_buy(client, current_price, action, active_mode, snapshot)
-
-    # Priority 3: Spike sell (sell BTC reserve on significant price pump)
-    action = usd_check_spike_sell(cfg, current_price, btc_balance, vol_multiplier)
-    if action:
-        return _dispatch_sell(client, current_price, action, active_mode, snapshot)
-
-    # DCA is intentionally suspended during USD accumulation mode.
-    # DCA means "buy BTC on a schedule" — it doesn't invert.
-    # The recycler and spike-sell system handles USD accumulation trading.
-    logger.debug("USD mode: DCA halted — resumes when bot switches to BTC accumulation")
-
-    return False
 
 
 # ── Pending-order reconciliation ───────────────────────────────────────────────
@@ -750,24 +586,11 @@ def main():
             # ── Get current snapshot ──────────────────────────────────────────
             snapshot = get_latest_snapshot()
 
-            # ── Dispatch to correct strategy set ─────────────────────────────
-            # STRATEGY_VERSION selects the engine. v1 is the unchanged legacy
-            # path (BTC/USD accumulate + the Sideways Range Recycler overlay).
-            # v2 is the always-on Universal Recycler + Harvest + regime detector.
-            if cfg.strategy_version == "v2":
-                run_v2_strategies(client, current_price, snapshot, active_mode,
-                                  atr_pct, atr_baseline_pct, vol_multiplier)
-            else:
-                if active_mode == Mode.BTC_ACCUMULATE:
-                    run_btc_accumulate_strategies(client, current_price, snapshot,
-                                                  active_mode, vol_multiplier)
-                elif active_mode == Mode.USD_ACCUMULATE:
-                    run_usd_accumulate_strategies(client, current_price, snapshot,
-                                                  active_mode, vol_multiplier)
-                # AUTO mode is resolved to BTC or USD above — never reaches here.
-
-                # ── Sideways Market overlay (Range Recycler) ─────────────────
-                run_range_recycler(client, current_price, snapshot, active_mode)
+            # ── Dispatch to the strategy engine ──────────────────────────────
+            # v2 is the only execution path: the always-on Universal Recycler +
+            # Harvest + regime detector.
+            run_v2_strategies(client, current_price, snapshot, active_mode,
+                              atr_pct, atr_baseline_pct, vol_multiplier)
 
             consecutive_errors = 0
 

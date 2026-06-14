@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 # "onboarding" is a DB pseudo-trade, not a real order.
 THROTTLE_BYPASS_REASONS = {
     "recycler_rebuy",        # BTC mode cycle close
-    "usd_recycler_resell",   # USD mode cycle close
     "onboarding",            # not a real trade
 }
 

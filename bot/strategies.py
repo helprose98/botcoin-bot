@@ -1,32 +1,23 @@
 """
-strategies.py — All trading strategy logic for both accumulation modes.
+strategies.py — BTC-accumulation building blocks and the v2 orchestrator.
 
-BTC_ACCUMULATE mode  (bull market / stacking sats)
-─────────────────────────────────────────────────
+BTC_ACCUMULATE building blocks
+──────────────────────────────
   • DCA:            Buy BTC on a schedule with USD
   • Dip buy:        Deploy USD reserve when price drops (3 tiers)
   • Recycler sell:  Sell small % of BTC when significantly above cost basis
   • Recycler rebuy: Rebuy that BTC when price corrects — net more BTC
 
-USD_ACCUMULATE mode  (bear market / stacking dollars)
-──────────────────────────────────────────────────────
-  • DCA:            Sell BTC on a schedule for USD  (inverted)
-  • Spike sell:     Deploy BTC reserve when price spikes (3 tiers, inverted)
-  • Recycler buy:   Buy small % of USD worth of BTC when significantly below sell price
-  • Recycler resell:Resell that BTC when price bounces — net more USD
-
-The logic is perfectly symmetric. What BTC mode does with USD, USD mode does
-with BTC — every parameter has a mirror counterpart.
+DCA and dip buys are wired into the regime-driven v2 orchestrator
+(v2_plan_actions), which combines them with the always-on Universal Recycler,
+the Harvest profit-taker, and the event-driven regime detector.
 """
 
 import logging
 from datetime import datetime, timezone, timedelta
 
 from config import Config
-from database import (
-    get_last_trade_by_reason, get_recent_high, get_recent_low,
-    get_latest_snapshot, get_state, set_state
-)
+from database import get_last_trade_by_reason, get_recent_high, get_state, set_state
 from volatility import apply_multiplier
 
 logger = logging.getLogger(__name__)
@@ -273,173 +264,17 @@ def btc_check_recycler_rebuy(cfg: Config, current_price: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  USD ACCUMULATE MODE  (perfectly inverted)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def usd_check_spike_sell(cfg: Config, current_price: float,
-                          btc_balance: float,
-                          vol_multiplier: float = 1.0) -> dict | None:
-    """
-    USD mode: Deploy BTC reserve when price SPIKES above recent low.
-    Mirror of btc_check_dip_buy — sells BTC on pumps instead of buying on dips.
-
-    vol_multiplier scales the base spike thresholds identically to the dip-buy
-    path (< 1.0 tightens, > 1.0 loosens). Defaults to 1.0 (no adjustment).
-    """
-    recent_low = get_recent_low(hours=168)
-    if not recent_low or recent_low <= 0:
-        return None
-
-    rise_pct = (current_price - recent_low) / recent_low
-    logger.debug("USD spike check: price=$%.2f low=$%.2f rise=%.1f%% vol_mult=%.3f",
-                 current_price, recent_low, rise_pct * 100, vol_multiplier)
-
-    # Effective (volatility-adjusted) thresholds.
-    eff_t3 = apply_multiplier(cfg.dip_tier3_threshold, vol_multiplier)
-    eff_t2 = apply_multiplier(cfg.dip_tier2_threshold, vol_multiplier)
-    eff_t1 = apply_multiplier(cfg.dip_threshold_pct, vol_multiplier)
-
-    if rise_pct >= eff_t3:
-        tier, deploy_pct, reason = 3, cfg.dip_tier3_deploy, "usd_spike_sell_tier3"
-    elif rise_pct >= eff_t2:
-        tier, deploy_pct, reason = 2, cfg.dip_tier2_deploy, "usd_spike_sell_tier2"
-    elif rise_pct >= eff_t1:
-        tier, deploy_pct, reason = 1, cfg.dip_buy_deploy_pct, "usd_spike_sell_tier1"
-    else:
-        return None
-
-    if _hours_since_last("usd_spike_sell_tier1") < cfg.dip_cooldown_hours or \
-       _hours_since_last("usd_spike_sell_tier2") < cfg.dip_cooldown_hours or \
-       _hours_since_last("usd_spike_sell_tier3") < cfg.dip_cooldown_hours:
-        logger.debug("USD spike tier %d: cooldown active", tier)
-        return None
-
-    btc_reserve  = btc_balance * cfg.recycler_pool_percent
-    btc_to_sell  = btc_reserve * deploy_pct
-    min_btc      = cfg.min_order_usd / current_price
-    max_btc      = cfg.max_order_usd / current_price
-    btc_to_sell  = max(min_btc, min(btc_to_sell, max_btc))
-
-    if btc_to_sell < min_btc:
-        logger.warning("USD spike sell: BTC reserve too small (%.8f BTC)", btc_reserve)
-        return None
-
-    logger.info("USD spike sell tier %d: rise=%.1f%% selling %.8f BTC ($%.2f)",
-                tier, rise_pct * 100, btc_to_sell, btc_to_sell * current_price)
-    return {"type": "sell", "btc_amount": btc_to_sell, "reason": reason,
-            "tier": tier, "rise_pct": rise_pct}
-
-
-def usd_check_recycler_buy(cfg: Config, current_price: float,
-                            usd_balance: float,
-                            avg_sell_basis: float) -> dict | None:
-    """
-    USD mode: Buy a small slice of BTC when price is well below our avg sell price.
-    Mirror of btc_check_recycler_sell — accumulates BTC temporarily to resell higher.
-    avg_sell_basis: the average price at which we've been selling BTC for USD.
-    """
-    if avg_sell_basis <= 0 or usd_balance <= 0:
-        return None
-
-    discount_pct = (avg_sell_basis - current_price) / avg_sell_basis
-    if discount_pct < cfg.recycler_sell_threshold_pct:
-        logger.debug("USD recycler buy: price only %.1f%% below sell basis $%.2f (need %.1f%%)",
-                     discount_pct * 100, avg_sell_basis, cfg.recycler_sell_threshold_pct * 100)
-        return None
-
-    if _hours_since_last("usd_recycler_buy") < cfg.recycler_sell_cooldown_hours:
-        logger.debug("USD recycler buy: cooldown active")
-        return None
-
-    usd_to_spend = usd_balance * cfg.recycler_sell_pct
-    usd_to_spend = max(cfg.min_order_usd, min(usd_to_spend, cfg.max_order_usd))
-
-    if usd_to_spend < cfg.min_order_usd:
-        return None
-
-    logger.info("USD recycler BUY: price %.1f%% below avg sell $%.2f → buying $%.2f of BTC",
-                discount_pct * 100, avg_sell_basis, usd_to_spend)
-    set_state("usd_recycler_last_buy_price", str(current_price))
-    set_state("usd_recycler_waiting_resell", "true")
-    return {"type": "buy", "usd_amount": usd_to_spend, "reason": "usd_recycler_buy",
-            "discount_pct": discount_pct}
-
-
-def usd_check_recycler_resell(cfg: Config, current_price: float,
-                               btc_balance: float) -> dict | None:
-    """
-    USD mode: After a recycler buy, resell the BTC when price bounces.
-    Mirror of btc_check_recycler_rebuy.
-    """
-    if get_state("usd_recycler_waiting_resell", "false") != "true":
-        return None
-
-    buy_price = float(get_state("usd_recycler_last_buy_price", "0") or 0)
-    if buy_price <= 0:
-        return None
-
-    rise_from_buy = (current_price - buy_price) / buy_price
-    if rise_from_buy < cfg.recycler_rebuy_drop_pct:
-        logger.debug("USD recycler resell: waiting for %.1f%% rise from $%.2f (currently %.1f%%)",
-                     cfg.recycler_rebuy_drop_pct * 100, buy_price, rise_from_buy * 100)
-        return None
-
-    # Sell the recycler BTC slice (same percentage we used to buy)
-    btc_to_sell = btc_balance * cfg.recycler_sell_pct
-    min_btc     = cfg.min_order_usd / current_price
-    btc_to_sell = max(min_btc, btc_to_sell)
-
-    logger.info("USD recycler RESELL: price rose %.1f%% from buy $%.2f → selling %.8f BTC",
-                rise_from_buy * 100, buy_price, btc_to_sell)
-    set_state("usd_recycler_waiting_resell", "false")
-    return {"type": "sell", "btc_amount": btc_to_sell, "reason": "usd_recycler_resell",
-            "rise_pct": rise_from_buy}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SHARED UTILITY
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_usd_avg_sell_basis() -> float:
-    """
-    Calculate the average price at which the bot has sold BTC for USD
-    (used by USD mode recycler logic).
-
-    DEPRECATED in v2.0 — retained ONLY so the v1 strategy path (USD_ACCUMULATE
-    mode) keeps working unchanged while STRATEGY_VERSION="v1". The v2 stack never
-    calls this; the usd_spike_sell_*/usd_dca_sell mechanisms it serves are the
-    behavior v2 exists to replace. To be removed in the post-dry-run cleanup
-    commit (impl spec §9, step 12), once production has moved to v2.
-    """
-    from database import get_all_trades
-    trades = get_all_trades()
-    sell_trades = [t for t in trades
-                   if t["side"] == "sell" and
-                   t["reason"] in ("usd_dca_sell", "usd_spike_sell_tier1",
-                                   "usd_spike_sell_tier2", "usd_spike_sell_tier3")]
-    if not sell_trades:
-        return 0.0
-    total_btc = sum(t["btc_amount"] for t in sell_trades)
-    total_usd = sum(t["usd_amount"] for t in sell_trades)
-    return total_usd / total_btc if total_btc > 0 else 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  STRATEGY v2.0 — regime-driven orchestrator
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # v2 keeps the proven BTC-accumulation building blocks (DCA, dip buys) and bolts
 # on three new always-on systems — the event-driven regime detector, the
-# Universal Recycler, and Harvest — replacing the v1 USD-accumulation drain
-# (usd_spike_sell_*, usd_dca_sell, usd_recycler_*). Those v1 functions are NOT
-# deleted here because the v1 path must remain runnable while STRATEGY_VERSION is
-# "v1"; the v2 orchestrator simply never calls them. They are scheduled for
-# removal in the post-dry-run cleanup commit (impl spec §9, step 12).
+# Universal Recycler, and Harvest.
 #
 # The orchestrator is a pure planner: it returns an ORDERED list of action dicts
 # and places no orders itself. main.py routes each action through the global
-# throttle and the shared execute_buy/execute_sell path, exactly as the v1
-# dispatch does, so the anti-thrash dampener still governs every v2 trade.
+# throttle and the shared execute_buy/execute_sell path, so the anti-thrash
+# dampener governs every trade.
 
 
 def v2_plan_actions(cfg: Config, current_price: float, ma200,
@@ -463,9 +298,8 @@ def v2_plan_actions(cfg: Config, current_price: float, ma200,
     the RAW atr_pct/baseline_pct (NOT the clamped vol_multiplier) so the recycler
     bands reach the Storm bucket — see Q-new-4 in the impl spec.
     """
-    # Imported here (not at module top) to keep the v1 strategy library free of
-    # any hard dependency on the v2 modules: a v1-only deployment never imports
-    # them, and there is no circular-import risk at load time.
+    # Imported here (not at module top) to avoid a circular import at load time:
+    # universal_recycler and harvest import from this module's building blocks.
     from mode_manager import OperatingRegime
     import universal_recycler
     import harvest

@@ -41,11 +41,6 @@ class ConfigDefaultsTest(unittest.TestCase):
     def setUp(self):
         self.cfg = config.load_config()
 
-    def test_strategy_version_defaults_to_v1(self):
-        # The single most important safety default: a bot with no STRATEGY_VERSION
-        # set must stay on the legacy v1 engine.
-        self.assertEqual(self.cfg.strategy_version, "v1")
-
     def test_harvest_bands_ordered(self):
         # Exit must sit below the entry threshold, both above parity with the MA.
         self.assertLess(self.cfg.harvest_exit_pct, self.cfg.harvest_threshold_pct)

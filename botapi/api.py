@@ -674,21 +674,11 @@ def _get_volatility_status():
     }
 
 
-def _get_strategy_version() -> str:
-    """Return the configured strategy engine ("v1" or "v2").
-
-    Read from .env so the dashboard can degrade gracefully against a v1.x bot
-    that has no v2 keys at all (defaults to "v1").
-    """
-    env = _read_env()
-    return env.get("STRATEGY_VERSION", "v1").lower().strip()
-
-
 def _get_regime_status() -> dict:
-    """Build the v2 event-driven regime block from bot_state (additive, v2-only).
+    """Build the v2 event-driven regime block from bot_state.
 
     Reads the keys regime_detector.py persists; returns a chop/cold-start default
-    when those keys are absent (i.e. the bot is still on v1.x).
+    when those keys are absent (i.e. the bot has not yet recorded a regime).
     """
     return {
         "state":      _state("regime_current", "chop"),
@@ -697,11 +687,11 @@ def _get_regime_status() -> dict:
 
 
 def _get_harvest_status() -> dict:
-    """Build the v2 Harvest block from bot_state (additive, v2-only).
+    """Build the v2 Harvest block from bot_state.
 
     Mirrors harvest.get_harvest_status using only bot_state reads so the API has
     no hard dependency on the bot package. All fields fall back to inert
-    defaults when the bot is on v1.x and has never written them.
+    defaults when the bot has not yet written them.
     """
     def _f(key, default=0.0):
         raw = _state(key, "")
@@ -731,8 +721,8 @@ def _get_operating_regime_status(current_price, ma200) -> dict:
 
     Pure function of price vs the 200MA and the configured harvest bands. Falls
     back to "accumulate" with ma_available=False when the 200MA is not yet built
-    (insufficient history) or the bot is on v1.x — the conservative,
-    prime-directive-aligned default of "keep stacking until a rally is proven".
+    (insufficient history) — the conservative, prime-directive-aligned default
+    of "keep stacking until a rally is proven".
     """
     env = _read_env()
     try:
@@ -757,9 +747,9 @@ def _get_operating_regime_status(current_price, ma200) -> dict:
 
 
 def _get_recycler_positions() -> list:
-    """Return open v2 Universal Recycler positions for /api/status (additive).
+    """Return open v2 Universal Recycler positions for /api/status.
 
-    Empty list when the table has no open rows (including on a v1.x bot).
+    Empty list when the table has no open rows.
     """
     rows = query(
         "SELECT id, buy_price, btc_amount, sell_band_price, timestamp "
@@ -928,8 +918,7 @@ def status():
             "sideways":        _get_sideways_status(),
             "throttle":        _get_throttle_status(),
             "volatility":      _get_volatility_status(),
-            # ── Strategy v2.0 additive fields (inert defaults on a v1.x bot). ──
-            "strategy_version":   _get_strategy_version(),
+            # ── Strategy v2.0 fields. ──
             "regime_state":       _get_regime_status()["state"],
             "regime_substate":    _get_regime_status()["entered_at"],
             "operating_regime":   _get_operating_regime_status(current_price, ma200),
@@ -1149,13 +1138,10 @@ def save_settings():
         # Anti-thrash dampener (v1.5.0)
         "MIN_GAP_BETWEEN_TRADES_SECONDS":  body.get("min_gap_between_trades_seconds"),
         "MAX_TRADES_PER_DAY":              body.get("max_trades_per_day"),
-        # ── Strategy v2.0 keys (dormant on v1; active when STRATEGY_VERSION=v2) ──
+        # ── Strategy v2.0 keys ──
         # These come from two places in the dashboard: (1) the aggression dial,
         # which writes the five size knobs as a preset bundle; (2) the expert
-        # drawer, which lets the operator tune any of the 22 v2 keys directly.
-        # All keys are accepted on a v1.5.2 bot too — they simply sit in .env
-        # unused until the operator flips STRATEGY_VERSION to v2.
-        "STRATEGY_VERSION":                body.get("strategy_version"),
+        # drawer, which lets the operator tune any of the v2 keys directly.
         "HARVEST_THRESHOLD_PCT":           body.get("harvest_threshold_pct"),
         "HARVEST_EXIT_PCT":                body.get("harvest_exit_pct"),
         "HARVEST_SUSTAIN_DAYS":            body.get("harvest_sustain_days"),
@@ -1178,12 +1164,6 @@ def save_settings():
         "REBUILD_DCA_AMOUNT_USD":          body.get("rebuild_dca_amount_usd"),
         "REBUILD_DCA_DAYS":                body.get("rebuild_dca_days"),
     }
-    # STRATEGY_VERSION: validate before accepting (only "v1" or "v2").
-    if allowed.get("STRATEGY_VERSION") is not None:
-        sv = str(allowed["STRATEGY_VERSION"]).lower().strip()
-        if sv not in ("v1", "v2"):
-            return jsonify({"ok": False, "error": "strategy_version must be 'v1' or 'v2'"}), 400
-        allowed["STRATEGY_VERSION"] = sv
     # RECYCLER_BAND_REFERENCE: validate before accepting.
     if allowed.get("RECYCLER_BAND_REFERENCE") is not None:
         rbr = str(allowed["RECYCLER_BAND_REFERENCE"]).lower().strip()
