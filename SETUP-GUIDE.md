@@ -101,7 +101,54 @@ The dashboard connects live to your bot and shows real-time data.
 
 ## Updating the Bot
 
-When a new version is available, an orange **Update** badge appears in the dashboard header. Click it and confirm — the bot pulls the latest code from GitHub and rebuilds automatically in about 2 minutes. No SSH required.
+### Normal path (dashboard)
+
+When a new version is available, an orange **Update** badge appears in the dashboard header. Click it and confirm. This does not run anything inside the bot — it drops a marker file that a host-side watcher (a one-line cron job) picks up within ~60 seconds and runs `update.sh` on the host.
+
+`update.sh` is safe by design:
+- It **builds the new images first, while the old containers keep running**, then swaps. If the build fails, the old version stays up — no downtime.
+- It **health-checks** `http://localhost:8081/api/health` for up to 60s after the swap. If the new version doesn't come up healthy, it **rolls back** to the previous version automatically.
+- It is **idempotent**: re-clicking Update on an already-current bot is a no-op.
+
+### Watching an update / reading the log
+
+Every step is logged with timestamps. From SSH:
+
+```bash
+tail -f /root/kraken-btc-bot/logs/update.log
+```
+
+A machine-readable status the dashboard polls lives at `/root/kraken-btc-bot/data/update.status`.
+
+### Manual update from SSH (if the dashboard is unreachable)
+
+The dashboard button only writes the marker file. You can do the same thing by hand, or just run the update script directly:
+
+```bash
+cd /root/kraken-btc-bot
+# Either trigger the watcher:
+touch data/update.trigger
+# ...or run the safe update script directly (recommended if you want to watch it):
+bash update.sh
+```
+
+### If an update ever leaves the bot down
+
+`update.sh` rolls back automatically, but if you ever see no containers (`docker ps` empty) the unconditional recovery is always:
+
+```bash
+cd /root/kraken-btc-bot && docker compose up -d --build
+```
+
+### First-time install of the update watcher
+
+The watcher is installed automatically on a fresh install. To (re)install or verify it on an existing box — this is **idempotent**, safe to re-run:
+
+```bash
+bash /root/kraken-btc-bot/install-update-watcher.sh
+# verify the cron drop-in exists:
+cat /etc/cron.d/botcoin-update
+```
 
 ---
 

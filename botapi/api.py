@@ -1594,21 +1594,50 @@ def dca_baseline():
 @requires_auth
 def update():
     """
-    Pull latest code from GitHub and rebuild containers.
-    Runs /app/update.sh in the background — bot will restart automatically.
+    Schedule a host-side update of the bot stack.
+
+    This endpoint does NOT run docker itself — doing so inside the container
+    would kill the process orchestrating the restart. Instead it drops a marker
+    file on the shared data volume; a host cron watcher (installed by
+    install-update-watcher.sh) picks it up within ~60s and runs update.sh on the
+    HOST, which builds-then-swaps the containers safely with a health check and
+    automatic rollback. See update.sh for the full safety contract.
     """
-    # Write a trigger file on the shared data volume.
-    # A host-side cron job watches for this file and runs update.sh
-    # This way the update runs on the HOST and survives container restarts.
     trigger = Path("/app/data/update.trigger")
     try:
         trigger.write_text("update")
         return jsonify({
             "ok":      True,
-            "message": "Update started. Bot will restart in ~2 minutes. Refresh the dashboard."
+            "message": "Update scheduled. The host watcher will apply it within ~2 minutes."
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/update-status")
+@requires_auth
+def update_status():
+    """
+    Report the state of the most recent (or in-flight) host update so the
+    dashboard can poll for real progress instead of guessing on a timer.
+
+    Reads the JSON status file that update.sh maintains on the shared data
+    volume (data/update.status). States: running | success | failed |
+    rolled_back | manual. Absence of the file means no update has run since the
+    last container rebuild — reported as "idle".
+    """
+    status_path = Path("/app/data/update.status")
+    if not status_path.exists():
+        return jsonify({"state": "idle", "message": "", "version": _read_local_version()})
+    try:
+        raw = status_path.read_text().strip()
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        # Status file present but unreadable/partial (mid-write) — treat as
+        # still running rather than surfacing a parse error to the UI.
+        return jsonify({"state": "running", "message": "Update in progress.",
+                        "version": _read_local_version()})
+    return jsonify(data)
 
 
 if __name__ == "__main__":
