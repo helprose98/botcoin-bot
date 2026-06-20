@@ -113,6 +113,7 @@ from database import (
     get_avg_cost_basis_from_ledger, update_snapshot_basis,
 )
 from kraken_client import KrakenClient, KrakenAPIError
+from snapshots import _maybe_write_daily_snapshot
 from onboarding import run_onboarding
 from mode_manager import (
     Mode, get_active_mode, get_mode_status,
@@ -591,6 +592,12 @@ def main():
             # Harvest + regime detector.
             run_v2_strategies(client, current_price, snapshot, active_mode,
                               atr_pct, atr_baseline_pct, vol_multiplier)
+
+            # Daily snapshot — runs once per UTC day, idempotent
+            try:
+                _maybe_write_daily_snapshot()
+            except Exception as e:
+                logger.warning("daily_snapshot failed: %s", e)
 
             consecutive_errors = 0
 

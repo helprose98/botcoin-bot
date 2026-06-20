@@ -127,6 +127,27 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_trades_mode       ON trades(active_mode);
             CREATE INDEX IF NOT EXISTS idx_range_positions_status ON range_positions(status);
             CREATE INDEX IF NOT EXISTS idx_deposits_timestamp ON deposits(timestamp);
+
+            -- Daily portfolio snapshot — one row per UTC day, idempotent
+            -- (INSERT … ON CONFLICT(snapshot_date) DO UPDATE)
+            CREATE TABLE IF NOT EXISTS daily_snapshots (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_date     TEXT NOT NULL UNIQUE,  -- YYYY-MM-DD UTC, one row per day
+                snapshot_ts       TEXT NOT NULL,         -- ISO 8601 UTC exact write time
+                btc_stack         REAL NOT NULL,         -- BTC holdings at snapshot time
+                usd_reserve       REAL NOT NULL,         -- USD balance at snapshot time
+                btc_price_usd     REAL NOT NULL,         -- last Kraken price at snapshot time
+                total_value_usd   REAL NOT NULL,         -- btc_stack * btc_price_usd + usd_reserve
+                avg_cost_basis    REAL NOT NULL,         -- volume-weighted avg buy price (all buys)
+                total_deposits_usd REAL NOT NULL,        -- sum of USD-equivalent Kraken deposits
+                total_dca_usd     REAL NOT NULL,         -- cumulative DCA/bot spend (buy side)
+                trade_count       INTEGER NOT NULL,      -- total non-onboarding trades to date
+                regime            TEXT NOT NULL,         -- accumulate / neutral / harvest
+                aggression_level  TEXT NOT NULL,         -- current dial setting from bot_state
+                notes             TEXT                   -- reserved for future use
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_daily_snapshots_date ON daily_snapshots(snapshot_date);
         """)
         _run_migrations(conn)
     logger.info("Database initialized at %s", DB_PATH)
@@ -537,6 +558,93 @@ def get_latest_snapshot():
         return conn.execute(
             "SELECT * FROM portfolio_snapshots ORDER BY timestamp DESC LIMIT 1"
         ).fetchone()
+
+
+# ── Daily snapshot helpers ────────────────────────────────────────────────────
+
+def upsert_daily_snapshot(
+    snapshot_date_utc: str,
+    snapshot_ts: str,
+    btc_stack: float,
+    usd_reserve: float,
+    btc_price_usd: float,
+    total_value_usd: float,
+    avg_cost_basis: float,
+    total_deposits_usd: float,
+    total_dca_usd: float,
+    trade_count: int,
+    regime: str,
+    aggression_level: str,
+    notes: str | None = None,
+) -> None:
+    """Insert or update the daily_snapshots row for snapshot_date_utc.
+
+    Idempotent: if a row already exists for the given UTC date, it is
+    overwritten with the latest values.  The UNIQUE constraint on
+    snapshot_date ensures exactly one row per day.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_snapshots
+                (snapshot_date, snapshot_ts, btc_stack, usd_reserve,
+                 btc_price_usd, total_value_usd, avg_cost_basis,
+                 total_deposits_usd, total_dca_usd, trade_count,
+                 regime, aggression_level, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_date) DO UPDATE SET
+                snapshot_ts        = excluded.snapshot_ts,
+                btc_stack          = excluded.btc_stack,
+                usd_reserve        = excluded.usd_reserve,
+                btc_price_usd      = excluded.btc_price_usd,
+                total_value_usd    = excluded.total_value_usd,
+                avg_cost_basis     = excluded.avg_cost_basis,
+                total_deposits_usd = excluded.total_deposits_usd,
+                total_dca_usd      = excluded.total_dca_usd,
+                trade_count        = excluded.trade_count,
+                regime             = excluded.regime,
+                aggression_level   = excluded.aggression_level,
+                notes              = excluded.notes
+            """,
+            (
+                snapshot_date_utc, snapshot_ts, btc_stack, usd_reserve,
+                btc_price_usd, total_value_usd, avg_cost_basis,
+                total_deposits_usd, total_dca_usd, trade_count,
+                regime, aggression_level, notes,
+            ),
+        )
+
+
+def get_daily_snapshots(days: int) -> list[dict]:
+    """Return up to `days` most-recent daily snapshot rows, oldest first.
+
+    Each element is a plain dict so callers (including the API layer) can
+    JSON-serialise without touching sqlite3 Row objects.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, snapshot_date, snapshot_ts, btc_stack, usd_reserve,
+                   btc_price_usd, total_value_usd, avg_cost_basis,
+                   total_deposits_usd, total_dca_usd, trade_count,
+                   regime, aggression_level, notes
+            FROM daily_snapshots
+            ORDER BY snapshot_date DESC
+            LIMIT ?
+            """,
+            (days,),
+        ).fetchall()
+    # Reverse so the caller receives oldest → newest (chart-friendly order).
+    return [dict(r) for r in reversed(rows)]
+
+
+def get_last_daily_snapshot_date() -> str | None:
+    """Return the most-recent snapshot_date string (YYYY-MM-DD) or None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT snapshot_date FROM daily_snapshots ORDER BY snapshot_date DESC LIMIT 1"
+        ).fetchone()
+    return row["snapshot_date"] if row else None
 
 
 # ── Price history functions ───────────────────────────────────────────────────

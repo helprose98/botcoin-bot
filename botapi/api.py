@@ -1014,6 +1014,51 @@ def deposits():
     return jsonify({"deposits": out, "totals": totals})
 
 
+# ── Daily snapshots (auth required) ──────────────────────────────────────────
+
+DEFAULT_DAYS = 90
+MAX_DAYS = 365
+
+
+@app.route("/api/snapshots/daily")
+@requires_auth
+def snapshots_daily():
+    """Return daily portfolio snapshots for charting and trajectory analysis.
+
+    Query params:
+        days (int, optional): Number of recent days to return.  Default 90,
+                              max 365.  Missing days are absent — no zero-fill.
+
+    Returns a JSON array of snapshot objects ordered oldest → newest.
+    HTTP 400 if `days` is non-integer or out of range.
+    """
+    days_param = request.args.get("days", str(DEFAULT_DAYS))
+    try:
+        days = int(days_param)
+    except (ValueError, TypeError):
+        return jsonify({"error": "days must be an integer"}), 400
+
+    if days < 1 or days > MAX_DAYS:
+        return jsonify(
+            {"error": f"days must be between 1 and {MAX_DAYS}"}
+        ), 400
+
+    rows = query(
+        """
+        SELECT id, snapshot_date, snapshot_ts, btc_stack, usd_reserve,
+               btc_price_usd, total_value_usd, avg_cost_basis,
+               total_deposits_usd, total_dca_usd, trade_count,
+               regime, aggression_level, notes
+        FROM   daily_snapshots
+        ORDER  BY snapshot_date DESC
+        LIMIT  ?
+        """,
+        (days,),
+    )
+    # Reverse to return oldest → newest (chart-friendly order).
+    return jsonify(list(reversed([dict(r) for r in rows])))
+
+
 @app.route("/api/open_orders")
 @requires_auth
 def open_orders():
